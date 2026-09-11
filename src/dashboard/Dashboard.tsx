@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent, type ReactNode } from 'react'
-import { ArrowRight, Bell, CalendarDays, Check, CircleGauge, Download, FileText, Layers, Map, Menu, PanelTop, Radar, Search, Settings, Shield, ShieldCheck, X, ChartNoAxesCombined, RefreshCw } from 'lucide-react'
+import { ArrowRight, Bell, CalendarDays, Check, CircleGauge, Download, FileText, Layers, Map, MapPin, Menu, PanelTop, Radar, Search, Settings, Shield, ShieldCheck, X, ChartNoAxesCombined, RefreshCw } from 'lucide-react'
 import { detections, missions, categories, colorForType, detectionCsv, downloadCsv, formatTime, type DetectionRecord } from './data'
 import { AnomalyPreview, ConfidenceChart, Sparkline, TimelineChart, TypeChart } from './Charts'
 import { DetectionMap } from './DetectionMap'
 import { AnomalyImage } from './AnomalyImage'
+import { ModelOutput } from './ModelOutput'
 import './dashboard.css'
 
 const navigation = [
   { label: 'Overview', path: '/', icon: Shield },
   { label: 'Detections', path: '/detections', icon: PanelTop },
   { label: 'Map', path: '/map', icon: Map },
-  { label: 'Analysis', path: '/analysis', icon: ChartNoAxesCombined },
+  { label: 'Model Output', path: '/analysis', icon: ChartNoAxesCombined },
   { label: 'Missions', path: '/missions', icon: ShieldCheck },
   { label: 'Data Quality', path: '/data-quality', icon: CircleGauge },
   { label: 'Reports', path: '/reports', icon: FileText },
@@ -70,16 +71,18 @@ function DetectionsView({ items, onSelect }: { items: DetectionRecord[]; onSelec
       <div className="ds-pagination"><span>{filtered.length ? page * 15 + 1 : 0}–{Math.min((page + 1) * 15, filtered.length)} of {filtered.length}</span><button disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button><button disabled={(page + 1) * 15 >= filtered.length} onClick={() => setPage(page + 1)}>Next</button></div>
     </Panel></>
 }
-function MapView({ items, onSelect }: { items: DetectionRecord[]; onSelect: (item: DetectionRecord) => void }) {
+function MapView({ items, onSelect, navigate }: { items: DetectionRecord[]; onSelect: (item: DetectionRecord) => void; navigate: Navigate }) {
   const [type, setType] = useState('All types')
   const filtered = items.filter(item => type === 'All types' || item.type === type)
+  const [located, setLocated] = useState<DetectionRecord | null>(items[0] ?? null)
+  const inspect = (item: DetectionRecord) => { setLocated(item); onSelect(item) }
   return <><div className="ds-page-intro"><div><h2>Survey detection map</h2><p>Mock observations along an illustrative offshore survey track. Select a marker to inspect its details and anomaly reference image.</p></div></div>
-    <Panel title="Geospatial overview" action={<select value={type} onChange={event => setType(event.target.value)} aria-label="Map detection type"><option>All types</option>{categories.map(category => <option key={category.name}>{category.name}</option>)}</select>}><DetectionMap full items={filtered} onSelect={onSelect}/></Panel></>
+    <div className="ds-map-workspace"><Panel title="GPS-tagged detections" action={<select value={type} onChange={event => setType(event.target.value)} aria-label="Map detection type"><option>All types</option>{categories.map(category => <option key={category.name}>{category.name}</option>)}</select>}><DetectionMap full items={filtered} onSelect={inspect}/></Panel>
+      <Panel title="Geolocation result" className="ds-geolocation"><div className="ds-geo-state"><MapPin size={20}/><div><span>Position quality</span><strong>Estimated · GPS synchronized</strong></div></div>{located && <><dl><div><dt>Detection</dt><dd>#{located.id} · {located.type}</dd></div><div><dt>Latitude</dt><dd>{located.latitude.toFixed(4)}° N</dd></div><div><dt>Longitude</dt><dd>{located.longitude.toFixed(4)}° E</dd></div><div><dt>Depth</dt><dd>{located.depth.toFixed(1)} m</dd></div><div><dt>Horizontal accuracy</dt><dd>± 4.8 m</dd></div><div><dt>Source ping</dt><dd>288,412</dd></div><div><dt>Survey</dt><dd>{located.mission}</dd></div><div><dt>Position basis</dt><dd>Vehicle GPS + ping timestamp</dd></div></dl><p>The sensor-to-world transform is unavailable in this mock log, so SonarSense preserves source metadata and labels this field position as an estimate.</p></>}<div className="ds-log-meta"><span>INPUT SONAR LOG</span><strong>IB-2505-17.xtf</strong><small>Navigation packets: 99.2% complete</small></div><footer><Link to="/detections" navigate={navigate}>Open detection records</Link></footer></Panel>
+    </div></>
 }
 function AnalysisView({ items }: { items: DetectionRecord[] }) {
-  return <><div className="ds-page-intro"><div><h2>Detection analysis</h2><p>Classification, confidence, and anomaly patterns from the mock survey dataset.</p></div></div><div className="ds-secondary-grid">
-    <Panel title="Detections by Type"><TypeChart items={items}/></Panel><Panel title="Detections Over Time"><TimelineChart compact/></Panel><Panel title="Anomaly Overview (VAE)"><AnomalyPreview/><p className="ds-panel-note">Simulated sonar return and reconstruction-error heatmap. Warmer colors indicate higher anomaly scores; no model is running.</p></Panel><Panel title="Detection Confidence Distribution"><ConfidenceChart items={items}/><p className="ds-panel-note">Distribution calculated from the {items.length} mock detections.</p></Panel>
-  </div></>
+  return <><div className="ds-page-intro"><div><h2>Model output</h2><p>Review the mock YOLO classifications, selected VAE evidence, and evaluation statistics from one processed sonar log.</p></div><span className="ds-status-pill"><Check size={15}/> Frontend mock data</span></div><ModelOutput items={items}/></>
 }
 function QualityView() {
   return <><div className="ds-page-intro"><div><h2>Data quality</h2><p>Quality-control results for seven completed mock missions.</p></div><span className="ds-status-pill"><Check size={15}/> Good · 92% overall</span></div><div className="ds-quality-stats">{[['Signal-to-noise ratio', '28.4 dB', 'Above 20 dB threshold'], ['GPS completeness', '99.2%', 'Position available for nearly all pings'], ['Valid sonar pings', '97.6%', '654,107 accepted returns'], ['Coverage continuity', '96.8%', 'All primary transects complete']].map(([title, value, caption]) => <Panel key={title} title={title}><div className="ds-big-value">{value}</div><p className="ds-panel-note">{caption}</p></Panel>)}</div><Panel title="Mission quality checks"><div className="ds-quality-list">{missions.map(mission => <div key={mission.id}><strong>{mission.id}</strong><span>{mission.name}</span><div className="ds-progress"><i style={{ width: `${mission.quality}%` }}/></div><b>{mission.quality}%</b><span className="ds-green">Passed</span></div>)}</div></Panel></>
@@ -140,7 +143,7 @@ export default function Dashboard() {
       <main id="dashboard-main" className="ds-main" tabIndex={-1}>
         {path === '/' && <Overview items={items} navigate={navigate} onSelect={setSelected} onMission={setSelectedMission}/>}
         {path === '/detections' && <DetectionsView items={items} onSelect={setSelected}/>}
-        {path === '/map' && <MapView items={items} onSelect={setSelected}/>}
+        {path === '/map' && <MapView items={items} onSelect={setSelected} navigate={navigate}/>}
         {path === '/analysis' && <AnalysisView items={items}/>}
         {path === '/missions' && <><div className="ds-page-intro"><div><h2>Mission history</h2><p>Seven completed missions covering 125 km². Select a mission to inspect its summary.</p></div></div><div className="ds-quality-stats">{[['Completed missions', '7'], ['Area covered', '125 km²'], ['Recorded pings', missions.reduce((sum, item) => sum + item.pings, 0).toLocaleString()], ['Average quality', '92%']].map(([title, value]) => <Panel title={title} key={title}><div className="ds-big-value">{value}</div></Panel>)}</div><Panel title="All missions"><MissionTable onSelect={setSelectedMission}/></Panel></>}
         {path === '/data-quality' && <QualityView/>}{path === '/reports' && <ReportsView items={items} announce={setToast}/>}{path === '/system-status' && <SystemView/>}{path === '/settings' && <SettingsView announce={setToast}/>}
