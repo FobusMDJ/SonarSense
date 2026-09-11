@@ -1,0 +1,299 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.128682,
+          15.2315174
+        ]
+      },
+      "properties": {
+        "ping_id": "1000",
+        "class": "class_6",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 2.74,
+        "timestamp": "2026-09-10T10:00:00Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1287659,
+          15.2315347
+        ]
+      },
+      "properties": {
+        "ping_id": "1001",
+        "class": "class_6",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 2.41,
+        "timestamp": "2026-09-10T10:00:01Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1287606,
+          15.231638
+        ]
+      },
+      "properties": {
+        "ping_id": "1002",
+        "class": "class_7",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 5.99,
+        "timestamp": "2026-09-10T10:00:02Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1288894,
+          15.231612
+        ]
+      },
+      "properties": {
+        "ping_id": "1003",
+        "class": "class_7",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 5.99,
+        "timestamp": "2026-09-10T10:00:03Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1287404,
+          15.231854
+        ]
+      },
+      "properties": {
+        "ping_id": "1004",
+        "class": "class_2",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 24.24,
+        "timestamp": "2026-09-10T10:00:04Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1291096,
+          15.231596
+        ]
+      },
+      "properties": {
+        "ping_id": "1005",
+        "class": "class_2",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 24.24,
+        "timestamp": "2026-09-10T10:00:05Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1290663,
+          15.231736
+        ]
+      },
+      "properties": {
+        "ping_id": "1006",
+        "class": "class_8",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 10.08,
+        "timestamp": "2026-09-10T10:00:06Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.129,
+          15.2318
+        ]
+      },
+      "properties": {
+        "ping_id": "1006",
+        "class": "class_0",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 0.0,
+        "timestamp": "2026-09-10T10:00:06Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.129,
+          15.2318
+        ]
+      },
+      "properties": {
+        "ping_id": "1006",
+        "class": "class_9",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 0.0,
+        "timestamp": "2026-09-10T10:00:06Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1289837,
+          15.231914
+        ]
+      },
+      "properties": {
+        "ping_id": "1007",
+        "class": "class_8",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 10.08,
+        "timestamp": "2026-09-10T10:00:07Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.12905,
+          15.23185
+        ]
+      },
+      "properties": {
+        "ping_id": "1007",
+        "class": "class_0",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 0.0,
+        "timestamp": "2026-09-10T10:00:07Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.12905,
+          15.23185
+        ]
+      },
+      "properties": {
+        "ping_id": "1007",
+        "class": "class_9",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 0.0,
+        "timestamp": "2026-09-10T10:00:07Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1289374,
+          15.2320569
+        ]
+      },
+      "properties": {
+        "ping_id": "1008",
+        "class": "class_7",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "port",
+        "ground_range_m": 24.7,
+        "timestamp": "2026-09-10T10:00:08Z"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          73.1293116,
+          15.2317941
+        ]
+      },
+      "properties": {
+        "ping_id": "1009",
+        "class": "class_7",
+        "confidence": 0.95,
+        "depth_m": 47.0,
+        "length_m": 0.0,
+        "width_m": 0.0,
+        "side": "starboard",
+        "ground_range_m": 24.55,
+        "timestamp": "2026-09-10T10:00:09Z"
+      }
+    }
+  ]
+}

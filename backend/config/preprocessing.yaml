@@ -1,0 +1,28 @@
+# SonarSense preprocessing pipeline configuration.
+# Every stage's tunables live here so experiments don't require code edits.
+
+dropout:
+  flat_std_threshold: 2.0      # row/col flagged as dropout if intensity std below this
+  saturation_margin: 3.0       # ...or mean within this many gray levels of 0/255
+  inpaint_radius: 5
+
+normalization:
+  method: percentile           # minmax | zscore | percentile
+  low_pct: 2.0
+  high_pct: 98.0
+
+denoising:
+  method: lee                  # lee | blind2unblind | dspnet
+  window_size: 7
+  weights_path: null           # required once method is blind2unblind/dspnet
+  fallback_on_missing_weights: true
+
+enhancement:
+  target_size: [512, 512]      # [width, height]
+  contrast_method: clahe       # clahe | histeq | none
+  clip_limit: 2.0
+  tile_grid_size: 8
+
+io:
+  raw_dir: data/raw
+  processed_dir: data/processed
