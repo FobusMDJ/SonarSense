@@ -6,6 +6,24 @@ This is the one place all the pipeline stages get wired together; the
 FastAPI layer (main.py) just calls `process_log()` in a background task and
 relays the progress callback over the log's WebSocket connection.
 
+DENOISING / CONTRAST DEFAULTS -- read before changing them: best.pt and the
+VAE checkpoint were both trained on images from
+preprocess_yolo_dataset_v2.py, which deliberately runs NEITHER denoise() NOR
+CLAHE ("trains on preprocessed-but-not-denoised images by design" -- that
+script's own docstring). Before src/preprocessing/denoising.py grew a
+method="none" option, PreprocessingPipeline.process_record() had no way to
+reproduce that at inference: it always ran the Lee filter (config/
+preprocessing.yaml's unconditional default) + CLAHE, so every live
+detection was already running on a distribution the model never saw
+training. `denoise_method`/`contrast_method` below default to "none"
+specifically to close that gap and match what the model actually learned.
+Passing "lee" or "blind2unblind" (B2U -- trained checkpoints exist at
+models/B2U.pth and models/B2Ueph2.pth, see config/backend.yaml's
+b2u_weights_path) is a legitimate thing to want to try in production even
+though it's technically out-of-distribution for the current checkpoints --
+just go in with that tradeoff in mind, and re-train/fine-tune on
+denoised images before trusting it as the new default.
+
 KNOWN V1 LIMITATIONS (stated plainly, not hidden):
   - Ingestion is fully materialized into memory before processing starts
     (`list(ingest_source(...))`), so frame-count-based progress reporting is
@@ -39,13 +57,14 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from src.backend import db
+from src.backend import db_backend as db
 from src.confidence.scoring import score_detection
+from src.geolocation.geojson_export import write_geojson
 from src.geolocation.georeference import geolocate_detection
 from src.geolocation.nav import NavFix
 from src.preprocessing.ingestion import SSSRecord, ingest_source
 from src.preprocessing.pipeline import PreprocessingPipeline
-from src.utils.config import get_logger
+from src.utils.config import get_logger, load_config
 from src.vae.test_vae import load_model as load_vae_model
 from src.vae.vae_analysis import crop_box, run_vae, save_all_modules
 
@@ -90,6 +109,28 @@ def _nav_fix_for_detection(record: SSSRecord, bbox: list[float], final_shape: tu
     return None
 
 
+def _build_preprocessing_config(denoise_method: str, denoise_weights_path: Optional[Path],
+                                 contrast_method: str) -> dict:
+    """Loads config/preprocessing.yaml (dropout/normalization/target_size
+    etc. stay whatever that file says) and overrides just the denoising and
+    contrast-enhancement sections with what THIS request asked for -- see
+    process_log's docstring / the module docstring for why "none"/"none" is
+    the default rather than config/preprocessing.yaml's own "lee"/"clahe"
+    (that file's defaults are for offline batch preprocessing, not this
+    train/serve-consistency-sensitive live path)."""
+    cfg = dict(load_config())  # config/preprocessing.yaml, the shared default
+    cfg["denoising"] = {
+        "method": denoise_method,
+        "window_size": 7,
+        "weights_path": str(denoise_weights_path) if denoise_weights_path else None,
+        "fallback_on_missing_weights": True,
+    }
+    enh = dict(cfg.get("enhancement", {}))
+    enh["contrast_method"] = contrast_method
+    cfg["enhancement"] = enh
+    return cfg
+
+
 def process_log(
     log_id: str,
     source_path: Path,
@@ -102,6 +143,9 @@ def process_log(
     yolo_conf: float = 0.25,
     port_is_left: bool = True,
     device: Optional[str] = None,
+    denoise_method: str = "none",
+    denoise_weights_path: Optional[Path] = None,
+    contrast_method: str = "none",
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
     from ultralytics import YOLO
@@ -121,7 +165,8 @@ def process_log(
             raise ValueError(f"No frames could be ingested from {source_path}")
         source_format = _source_format_of(records)
 
-        pipeline = PreprocessingPipeline()
+        preproc_cfg = _build_preprocessing_config(denoise_method, denoise_weights_path, contrast_method)
+        pipeline = PreprocessingPipeline(config=preproc_cfg)
         yolo = YOLO(str(yolo_weights))
         vae_model = load_vae_model(str(vae_weights), torch_device)
 
@@ -211,6 +256,7 @@ def process_log(
                         "lat": geo.lat if geo.method == "nav_fix" else None,
                         "lon": geo.lon if geo.method == "nav_fix" else None,
                         "geo_method": geo.method,
+                        "depth_m": geo.depth_m,  # None unless the nav sidecar/XTF actually carried one
                         "vae_panel_dir": fr["vae_panel_dir"],
                         "created_at": _now_iso(),
                     }
@@ -234,9 +280,17 @@ def process_log(
 def _write_reports(db_path: Path, log_id: str, out_dir: Path) -> None:
     """Per the challenge brief: 'a structured report (JSON or CSV format)
     ... detail the exact location (latitude/longitude), bounding dimensions,
-    and classification of each detected hazard.'"""
+    and classification of each detected hazard.' Also writes report.geojson
+    via the geolocation engine's own GeoJSON output method (src.geolocation.
+    geojson_export) -- the same FeatureCollection GET /logs/{id}/map serves
+    live, saved to disk so a log's geolocation results can be opened
+    directly in a GIS tool without going through the API."""
     with db.get_connection(db_path) as conn:
         detections = db.list_detections(conn, log_id)
+
+    geojson = write_geojson(out_dir / "report.geojson", detections, only_geolocated=True)
+    logger.info("Wrote %s (%d geolocated feature(s) of %d total detection(s))",
+                out_dir / "report.geojson", len(geojson["features"]), len(detections))
 
     report_rows = [{
         "detection_id": d["id"],

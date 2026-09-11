@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS logs (
     n_frames INTEGER NOT NULL DEFAULT 0,
     n_detections INTEGER NOT NULL DEFAULT 0,
     pixels_to_meters REAL,
+    denoise_method TEXT,               -- 'none' | 'lee' | 'blind2unblind' -- what THIS log was actually run with
+    contrast_method TEXT,              -- 'none' | 'clahe' | 'histeq'
     error_message TEXT
 );
 
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS detections (
     lat REAL,
     lon REAL,
     geo_method TEXT,                   -- 'nav_fix' | 'placeholder'
+    depth_m REAL,                      -- water depth below surface, NULL unless the nav
+                                        -- sidecar/XTF actually carried one (never fabricated)
     vae_panel_dir TEXT,
     created_at TEXT NOT NULL
 );
@@ -62,11 +66,29 @@ CREATE INDEX IF NOT EXISTS idx_detections_log_id ON detections(log_id);
 """
 
 
+# Columns added to `detections` after its initial release -- CREATE TABLE IF
+# NOT EXISTS above only applies to a brand-new DB file; an existing
+# sonarsense.db from before this column existed needs an explicit ALTER
+# TABLE, or every insert against it fails with "no column named depth_m".
+_DETECTIONS_MIGRATIONS = [
+    ("depth_m", "REAL"),
+]
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(detections)").fetchall()}
+    for col_name, col_type in _DETECTIONS_MIGRATIONS:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE detections ADD COLUMN {col_name} {col_type}")
+            logger.info("Migrated detections table: added column %s %s", col_name, col_type)
+
+
 def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(db_path)) as conn:
         conn.executescript(SCHEMA)
+        _migrate_schema(conn)
     logger.info("Initialized SQLite schema at %s", db_path)
 
 
@@ -89,11 +111,12 @@ def get_connection(db_path: str | Path = DEFAULT_DB_PATH) -> Iterator[sqlite3.Co
 # --------------------------------------------------------------------------
 
 def create_log(conn: sqlite3.Connection, log_id: str, filename: str, source_format: str,
-                uploaded_at: str, pixels_to_meters: Optional[float] = None) -> None:
+                uploaded_at: str, pixels_to_meters: Optional[float] = None,
+                denoise_method: Optional[str] = None, contrast_method: Optional[str] = None) -> None:
     conn.execute(
-        "INSERT INTO logs (id, filename, source_format, status, uploaded_at, pixels_to_meters) "
-        "VALUES (?, ?, ?, 'uploaded', ?, ?)",
-        (log_id, filename, source_format, uploaded_at, pixels_to_meters),
+        "INSERT INTO logs (id, filename, source_format, status, uploaded_at, pixels_to_meters, "
+        "denoise_method, contrast_method) VALUES (?, ?, ?, 'uploaded', ?, ?, ?, ?)",
+        (log_id, filename, source_format, uploaded_at, pixels_to_meters, denoise_method, contrast_method),
     )
 
 
@@ -135,15 +158,15 @@ def insert_detection(conn: sqlite3.Connection, det: dict[str, Any]) -> None:
             id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
             bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
             confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
-            lat, lon, geo_method, vae_panel_dir, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            lat, lon, geo_method, depth_m, vae_panel_dir, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
             det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
             *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
             det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
-            det.get("lat"), det.get("lon"), det.get("geo_method"), det.get("vae_panel_dir"),
-            det["created_at"],
+            det.get("lat"), det.get("lon"), det.get("geo_method"), det.get("depth_m"),
+            det.get("vae_panel_dir"), det["created_at"],
         ),
     )
 

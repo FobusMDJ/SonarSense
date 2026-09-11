@@ -35,10 +35,11 @@ from typing import Optional
 
 import torch
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.backend import db
+from src.backend import db_backend as db
+from src.backend.api_routes import router as frontend_api_router
 from src.backend.pipeline_runner import process_log
 from src.backend.schemas import Detection, LocalIngestRequest, LogSummary, ModelOutputStats, UploadResponse, VaeStats
 from src.geolocation.geojson_export import build_geojson, write_geojson
@@ -50,7 +51,10 @@ logger = get_logger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _cfg = load_config(str(PROJECT_ROOT / "config" / "backend.yaml"))
 
-DB_PATH = PROJECT_ROOT / _cfg.get("db_path", "sonarsense.db")
+DB_PATH = db.configure(_cfg, project_root=PROJECT_ROOT)  # Path (sqlite) or DSN string (postgres) --
+# see db_backend.py's module docstring. Everything below that already threads DB_PATH through
+# db.init_db(DB_PATH) / db.get_connection(DB_PATH) / run_pipeline(..., db_path=DB_PATH, ...)
+# keeps working unmodified regardless of which backend is active.
 UPLOAD_DIR = PROJECT_ROOT / _cfg.get("upload_dir", "backend_uploads")
 OUTPUT_DIR = PROJECT_ROOT / _cfg.get("output_dir", "backend_outputs")
 YOLO_WEIGHTS = PROJECT_ROOT / _cfg.get("yolo_weights_path", "best.pt")
@@ -79,6 +83,10 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# Frontend-shaped /api/* routes (FobusMDJ/SonarSense React app) -- additive,
+# alongside the /logs/* API above (see api_routes.py's module docstring).
+app.include_router(frontend_api_router)
 
 _progress_queues: dict[str, "queue.Queue[dict]"] = {}
 
@@ -473,6 +481,28 @@ def get_report_json(log_id: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "Report not ready yet -- log may still be processing.")
     return FileResponse(str(path), media_type="application/json", filename=f"{log_id}_report.json")
+
+
+@app.get("/logs/{log_id}/report.pdf")
+def get_report_pdf(log_id: str) -> Response:
+    from src.backend.reports import build_report_pdf
+    log = _require_log(log_id)
+    with db.get_connection(DB_PATH) as conn:
+        detections = db.list_detections(conn, log_id)
+    pdf_bytes = build_report_pdf(log, detections)
+    return Response(pdf_bytes, media_type="application/pdf",
+                     headers={"Content-Disposition": f'attachment; filename="{log_id}_report.pdf"'})
+
+
+@app.get("/logs/{log_id}/map.png")
+def get_map_png(log_id: str) -> Response:
+    from src.backend.reports import build_map_png
+    log = _require_log(log_id)
+    with db.get_connection(DB_PATH) as conn:
+        detections = db.list_detections(conn, log_id)
+    png_bytes = build_map_png(log, detections)
+    return Response(png_bytes, media_type="image/png",
+                     headers={"Content-Disposition": f'attachment; filename="{log_id}_map.png"'})
 
 
 @app.get("/logs/{log_id}/report.csv")
