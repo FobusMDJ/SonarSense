@@ -1,0 +1,71 @@
+# Local "deploy wherever" stack: a real Postgres+PostGIS instance + the
+# backend API, wired together. This is the concrete version of what
+# config/backend.yaml's db_backend/postgres_dsn fields document --
+# `docker compose up` gives you a working db_backend: postgres setup with
+# zero manual database setup (the `postgis/postgis` image ships the
+# extension pre-installed; POSTGRES_DB below is created automatically on
+# first boot, matching postgres_dsn's default in config/backend.yaml).
+#
+# NOT build/run-tested in this environment (no Docker daemon available
+# here) -- YAML-validated only. Before relying on this, run
+# `docker compose up --build` once yourself and confirm both containers
+# come up healthy.
+#
+# Usage:
+#   1. Set db_backend: postgres in config/backend.yaml (or override via
+#      an env var if you wire one in -- not done here, keeping config
+#      loading exactly as main.py already does it, i.e. from the yaml file).
+#   2. docker compose up --build
+#   3. Backend on http://localhost:8000, Postgres on localhost:5432.
+#
+# Model weights are intentionally NOT part of this compose file (large,
+# change independently of code/deploys) -- the volumes below mount them in
+# from the host; point them at your actual checkpoint paths, or remove a
+# mount if you baked weights into your own derived image instead.
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sonarsense
+      POSTGRES_USER: sonarsense
+      POSTGRES_PASSWORD: sonarsense   # change before deploying anywhere but a local machine
+    ports:
+      - "5432:5432"
+    volumes:
+      - sonarsense_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonarsense -d sonarsense"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./best.pt:/app/best.pt:ro
+      - ./src/vae/vae_epoch100.pth:/app/src/vae/vae_epoch100.pth:ro
+      - ./models:/app/models:ro
+      - sonarsense_uploads:/app/backend_uploads
+      - sonarsense_outputs:/app/backend_outputs
+    # config/backend.yaml is bind-mounted in (see the volumes entry above),
+    # so it's read directly from the host file -- no env-var plumbing here.
+    # Before `docker compose up`, set in that file:
+    #   db_backend: postgres
+    #   postgres_dsn: postgresql://sonarsense:sonarsense@db:5432/sonarsense
+    # ("db" is this compose network's hostname for the db service above --
+    # NOT localhost, which only works when both processes share one host's
+    # loopback interface, i.e. the non-Docker local-dev setup).
+
+volumes:
+  sonarsense_pgdata:
+  sonarsense_uploads:
+  sonarsense_outputs:

@@ -1,0 +1,91 @@
+"""Navigation fix data model + interpolation shared by both geolocation
+input paths (raw XTF nav packets, and the image+CSV-sidecar path)."""
+
+from __future__ import annotations
+
+import csv
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class NavFix:
+    """One vehicle position fix. `frame_index` ties it to a specific
+    ingested frame/tile/ping; `timestamp` (unix seconds, optional) is used
+    to interpolate between fixes when frame count != nav-fix count."""
+
+    frame_index: int
+    lat: float
+    lon: float
+    heading_deg: float  # compass bearing, 0=N, 90=E, clockwise
+    altitude_m: Optional[float] = None  # height above seafloor, if known
+    timestamp: Optional[float] = None
+
+
+def load_nav_sidecar(path: str | Path) -> list[NavFix]:
+    """Load a nav sidecar CSV with columns: frame_index,lat,lon,heading_deg[,altitude_m,timestamp]
+
+    This is the expected format for the "exported images + nav sidecar"
+    ingestion path. One row per frame/tile, in the same order the images
+    were exported.
+    """
+    path = Path(path)
+    fixes = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"frame_index", "lat", "lon", "heading_deg"}
+        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
+            raise ValueError(
+                f"Nav sidecar {path} must have columns {sorted(required)} "
+                f"(+ optional altitude_m, timestamp). Found: {reader.fieldnames}"
+            )
+        for row in reader:
+            fixes.append(NavFix(
+                frame_index=int(row["frame_index"]),
+                lat=float(row["lat"]),
+                lon=float(row["lon"]),
+                heading_deg=float(row["heading_deg"]),
+                altitude_m=float(row["altitude_m"]) if row.get("altitude_m") else None,
+                timestamp=float(row["timestamp"]) if row.get("timestamp") else None,
+            ))
+    fixes.sort(key=lambda f: f.frame_index)
+    return fixes
+
+
+def nearest_fix(fixes: list[NavFix], frame_index: int) -> Optional[NavFix]:
+    """Nearest-neighbor lookup by frame_index (fixes assumed sorted).
+    Returns None if `fixes` is empty."""
+    if not fixes:
+        return None
+    best = min(fixes, key=lambda f: abs(f.frame_index - frame_index))
+    return best
+
+
+def interpolate_fix(fixes: list[NavFix], frame_index: int) -> Optional[NavFix]:
+    """Linear interpolation between the two bracketing fixes by frame_index
+    (falls back to nearest_fix at the ends, or if fixes has <2 entries).
+    Heading is interpolated the short way around the compass (handles the
+    0/360 wraparound)."""
+    if not fixes:
+        return None
+    if len(fixes) == 1 or frame_index <= fixes[0].frame_index:
+        return fixes[0]
+    if frame_index >= fixes[-1].frame_index:
+        return fixes[-1]
+
+    for a, b in zip(fixes, fixes[1:]):
+        if a.frame_index <= frame_index <= b.frame_index:
+            span = b.frame_index - a.frame_index
+            t = 0.0 if span == 0 else (frame_index - a.frame_index) / span
+            lat = a.lat + t * (b.lat - a.lat)
+            lon = a.lon + t * (b.lon - a.lon)
+            # shortest-path heading interpolation
+            delta = ((b.heading_deg - a.heading_deg + 180) % 360) - 180
+            heading = (a.heading_deg + t * delta) % 360
+            alt = None
+            if a.altitude_m is not None and b.altitude_m is not None:
+                alt = a.altitude_m + t * (b.altitude_m - a.altitude_m)
+            return NavFix(frame_index=frame_index, lat=lat, lon=lon, heading_deg=heading, altitude_m=alt)
+    return nearest_fix(fixes, frame_index)

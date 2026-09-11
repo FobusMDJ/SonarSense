@@ -1,0 +1,27 @@
+# Backend service configuration. All paths are relative to the project
+# root unless absolute. Fill in real values before running main.py.
+
+yolo_weights_path: best.pt
+vae_weights_path: src/vae/vae_epoch100.pth
+
+db_path: sonarsense.db
+upload_dir: backend_uploads
+output_dir: backend_outputs
+
+default_yolo_conf: 0.25
+default_low_confidence_threshold: 40.0
+
+# Ground resolution (meters per pixel, across-track) AT THE FINAL/RESIZED
+# frame resolution the preprocessing pipeline produces (see
+# config/preprocessing.yaml's enhancement.target_size -- default 512x512).
+# THIS IS A PLACEHOLDER, not a calibrated value: there is currently no
+# source of truth for actual sonar range/swath width in this pipeline.
+# Override per-upload via the API's pixels_to_meters parameter once real
+# per-log range settings are available (from XTF ping headers or a nav
+# sidecar), and re-derive this default once a real value is known.
+default_pixels_to_meters: 0.15
+
+# Whether column 0 of a frame is the port (left) side of the swath. Only
+# matters for geolocation bearing calculation -- flip if detections end up
+# mirrored across the tow track once checked against real GPS data.
+port_is_left: true

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Model weights & large binaries (deploy these separately, don't commit)
+*.pt
+*.pth
+models/
+
+# Runtime data / generated output (never commit)
+sonarsense.db
+sonarsense_test.db
+backend_uploads/
+backend_outputs/
+outputs/
+runs/
+eval_out/
+
+# Raw/processed sonar data (large, not source code)
+data/
+
+# Local dev artifacts
+*.zip
+notebooks/.ipynb_checkpoints/
+.env
+
+# OS/editor
+.DS_Store
+.vscode/
