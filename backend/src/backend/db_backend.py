@@ -30,6 +30,7 @@ at all.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,9 +48,16 @@ def configure(cfg: dict, project_root: Optional[Path] = None) -> Any:
     default 'sqlite' -- the zero-setup option stays the default so existing
     deployments/configs that don't set this key are completely unaffected).
     Returns the resolved connection target to pass to init_db()/
-    get_connection() at every existing call site."""
+    get_connection() at every existing call site.
+
+    The DB_BACKEND / POSTGRES_DSN environment variables, when set, override
+    the corresponding config/backend.yaml keys -- this is what lets a real
+    Postgres password be supplied by a hosting platform's env var UI (e.g.
+    Render, via render.yaml's fromDatabase) instead of being committed to
+    git in a config file. Env vars win; config/backend.yaml is the local-
+    dev-friendly fallback."""
     global _active_module, _target_kwarg, _default_target
-    backend = (cfg.get("db_backend") or "sqlite").lower()
+    backend = (os.environ.get("DB_BACKEND") or cfg.get("db_backend") or "sqlite").lower()
 
     if backend == "sqlite":
         from src.backend import db as _db
@@ -61,7 +69,7 @@ def configure(cfg: dict, project_root: Optional[Path] = None) -> Any:
         from src.backend import db_postgis as _db
         _active_module = _db
         _target_kwarg = "dsn"
-        _default_target = cfg.get("postgres_dsn") or _db.DEFAULT_DSN
+        _default_target = os.environ.get("POSTGRES_DSN") or cfg.get("postgres_dsn") or _db.DEFAULT_DSN
     else:
         raise ValueError(f"Unknown db_backend {backend!r} in config/backend.yaml (expected 'sqlite' or 'postgres')")
 
