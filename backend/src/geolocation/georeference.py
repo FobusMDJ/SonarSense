@@ -53,6 +53,10 @@ class GeoResult:
     method: str  # "nav_fix" | "placeholder"
     across_track_m: float
     layback_corrected: bool = False
+    depth_m: float | None = None  # passed through from the nav fix, NOT computed here --
+    # this module has no way to derive water depth from pixels/geometry, so it's simply
+    # relayed when the nav fix happened to carry one (see NavFix.depth_m), and stays None
+    # otherwise rather than being invented.
 
 
 def offset_latlon(lat: float, lon: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
@@ -116,4 +120,5 @@ def geolocate_detection(
     except ImportError:
         lat, lon = offset_latlon(nav_fix.lat, nav_fix.lon, bearing, across_track_m)
 
-    return GeoResult(lat=lat, lon=lon, method="nav_fix", across_track_m=across_track_m)
+    return GeoResult(lat=lat, lon=lon, method="nav_fix", across_track_m=across_track_m,
+                      depth_m=nav_fix.depth_m)

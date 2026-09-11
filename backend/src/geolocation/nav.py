@@ -21,11 +21,18 @@ class NavFix:
     lon: float
     heading_deg: float  # compass bearing, 0=N, 90=E, clockwise
     altitude_m: Optional[float] = None  # height above seafloor, if known
+    depth_m: Optional[float] = None  # water depth AT the fix (below sea surface -- a
+    # DIFFERENT axis than altitude_m above, which is height above the seafloor). Optional
+    # because most nav sidecars built so far don't carry it; stays None rather than being
+    # fabricated when absent, matching this project's standing "never fake position data"
+    # convention (see georeference.py's GeoResult.method='placeholder'). API responses
+    # pass this straight through as null when unset rather than inventing a number.
     timestamp: Optional[float] = None
 
 
 def load_nav_sidecar(path: str | Path) -> list[NavFix]:
-    """Load a nav sidecar CSV with columns: frame_index,lat,lon,heading_deg[,altitude_m,timestamp]
+    """Load a nav sidecar CSV with columns:
+    frame_index,lat,lon,heading_deg[,altitude_m,depth_m,timestamp]
 
     This is the expected format for the "exported images + nav sidecar"
     ingestion path. One row per frame/tile, in the same order the images
@@ -39,7 +46,7 @@ def load_nav_sidecar(path: str | Path) -> list[NavFix]:
         if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
             raise ValueError(
                 f"Nav sidecar {path} must have columns {sorted(required)} "
-                f"(+ optional altitude_m, timestamp). Found: {reader.fieldnames}"
+                f"(+ optional altitude_m, depth_m, timestamp). Found: {reader.fieldnames}"
             )
         for row in reader:
             fixes.append(NavFix(
@@ -48,6 +55,7 @@ def load_nav_sidecar(path: str | Path) -> list[NavFix]:
                 lon=float(row["lon"]),
                 heading_deg=float(row["heading_deg"]),
                 altitude_m=float(row["altitude_m"]) if row.get("altitude_m") else None,
+                depth_m=float(row["depth_m"]) if row.get("depth_m") else None,
                 timestamp=float(row["timestamp"]) if row.get("timestamp") else None,
             ))
     fixes.sort(key=lambda f: f.frame_index)
@@ -87,5 +95,9 @@ def interpolate_fix(fixes: list[NavFix], frame_index: int) -> Optional[NavFix]:
             alt = None
             if a.altitude_m is not None and b.altitude_m is not None:
                 alt = a.altitude_m + t * (b.altitude_m - a.altitude_m)
-            return NavFix(frame_index=frame_index, lat=lat, lon=lon, heading_deg=heading, altitude_m=alt)
+            depth = None
+            if a.depth_m is not None and b.depth_m is not None:
+                depth = a.depth_m + t * (b.depth_m - a.depth_m)
+            return NavFix(frame_index=frame_index, lat=lat, lon=lon, heading_deg=heading,
+                          altitude_m=alt, depth_m=depth)
     return nearest_fix(fixes, frame_index)

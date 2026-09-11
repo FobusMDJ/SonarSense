@@ -3,13 +3,49 @@
 
 yolo_weights_path: best.pt
 vae_weights_path: src/vae/vae_epoch100.pth
+# Trained Blind2Unblind checkpoint, used only when a log is uploaded with
+# denoise_method=blind2unblind (default is "none" -- see below). Two
+# checkpoints exist under models/: B2U.pth (older) and B2Ueph2.pth (newer
+# mtime, used here) -- if B2Ueph2.pth turns out NOT to be the better of the
+# two, point this at B2U.pth instead, nothing else needs to change.
+b2u_weights_path: models/B2Ueph2.pth
 
 db_path: sonarsense.db
 upload_dir: backend_uploads
 output_dir: backend_outputs
 
+# Which persistence backend src/backend/db_backend.py should load: "sqlite"
+# (default, zero-setup -- a single file at db_path above, good for local
+# dev/demo) or "postgres" (real PostGIS-backed spatial database -- see
+# src/backend/db_postgis.py; needs `docker compose up db` or an existing
+# Postgres+PostGIS instance reachable at postgres_dsn below, plus
+# psycopg2-binary installed -- see requirements.txt). Switching this is the
+# ONLY change needed to move databases; no code or API-shape changes either
+# way, both backends return identical dicts from every function.
+db_backend: sqlite
+
+# Only read when db_backend: postgres, above. Connection string for a
+# running Postgres+PostGIS instance (see docker-compose.yml, which starts
+# one matching these exact defaults for local testing -- change the
+# password before using this anywhere but a local/dev machine).
+postgres_dsn: postgresql://sonarsense:sonarsense@localhost:5432/sonarsense
+
 default_yolo_conf: 0.25
 default_low_confidence_threshold: 40.0
+
+# IMPORTANT: best.pt and the VAE checkpoint were both trained on images from
+# preprocess_yolo_dataset_v2.py, which runs NEITHER denoising NOR CLAHE
+# ("trains on preprocessed-but-not-denoised images by design"). These
+# defaults ("none"/"none") make the live backend match that distribution --
+# NOT config/preprocessing.yaml's own defaults (lee/clahe), which are for
+# offline batch preprocessing and were never meant to describe what this
+# service should run live. Override per-upload via the API's
+# denoise_method/contrast_method parameters (choices: none/lee/blind2unblind
+# and none/clahe/histeq respectively) to experiment with denoising in
+# production -- just know that's out-of-distribution for the CURRENT
+# checkpoints until something gets re-trained/fine-tuned on denoised images.
+default_denoise_method: none
+default_contrast_method: none
 
 # Ground resolution (meters per pixel, across-track) AT THE FINAL/RESIZED
 # frame resolution the preprocessing pipeline produces (see

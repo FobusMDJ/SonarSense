@@ -10,12 +10,8 @@ tqdm>=4.66
 # --- Denoiser training (Blind2Unblind) / VAE ---
 torch>=2.2
 
-# --- YOLO11 / YOLO26 detection stages (in use now) ---
-# YOLO26 (src/detection/train_yolo26.py) needs a recent-enough ultralytics
-# release to know the "yolo26*.pt" weight names -- confirmed present as of
-# 8.4.x on PyPI; if `YOLO("yolo26n.pt")` raises a not-found error, just
-# `pip install -U ultralytics`.
-ultralytics>=8.4
+# --- YOLO11 detection stage (in use now) ---
+ultralytics>=8.2
 
 # --- Later pipeline stages (classification) ---
 # Uncomment as those modules are built.
@@ -30,3 +26,8 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9   # required by FastAPI for UploadFile/form parsing
 pydantic>=2.0
+psycopg2-binary>=2.9   # optional: only needed when config/backend.yaml sets db_backend: postgres
+                        # (see src/backend/db_postgis.py). SQLite (db_backend: sqlite, the
+                        # default) needs no extra driver -- it's stdlib.
+reportlab>=4.0          # GET /logs/{id}/report.pdf (src/backend/reports.py) -- matplotlib for
+                        # map.png is already listed above under Preprocessing.
