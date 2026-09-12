@@ -191,6 +191,11 @@ def _to_detection_row(geo: dict, log_id: str, frame_index: int, created_at: str)
         "geo_method": "nav_fix",  # every row here had a matched nav fix by construction --
         # rows with no nav match are skipped before this point, see run_csv_pipeline_to_detections
         "depth_m": geo["depth_m"],
+        "length_m": geo["length_m"],  # THIS engine's own real-world size, computed directly from
+        "width_m": geo["width_m"],    # bbox_w_px/bbox_h_px * range_per_pixel_m in geolocate_csv_
+        # detection above -- stored as-is so downstream readers (GET /logs/{id}/detections, the
+        # report writers) use it instead of re-deriving a size from a reconstructed bbox (see
+        # class_taxonomy.resolved_dimensions_m, which prefers these columns when they're set).
         "footprint_geojson": None,  # no pixel_y in this format -- see module docstring
         "vae_panel_dir": None,
         "created_at": created_at,

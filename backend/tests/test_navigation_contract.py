@@ -8,7 +8,7 @@ from src.geolocation.nav import load_nav_sidecar
 
 class NavigationContractTests(unittest.TestCase):
     def test_iso_timestamp_and_one_based_single_frame_are_accepted(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             path = Path(directory) / "metadata.csv"
             path.write_text(
                 "frame_index,lat,lon,heading_deg,altitude_m,depth_m,timestamp\n"
@@ -25,7 +25,7 @@ class NavigationContractTests(unittest.TestCase):
             )
 
     def test_invalid_coordinate_reports_the_csv_row(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             path = Path(directory) / "metadata.csv"
             path.write_text(
                 "frame_index,lat,lon,heading_deg\n0,120,-73.985,0\n",

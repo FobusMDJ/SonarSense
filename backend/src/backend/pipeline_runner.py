@@ -58,12 +58,13 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from src.backend import db_backend as db
+from src.backend import class_taxonomy, db_backend as db
 from src.backend.model_release import INFERENCE_LOCK, JOB_LOCK, get_vae_model, get_yolo_model
 from src.confidence.scoring import score_detection
 from src.geolocation.geojson_export import write_geojson
 from src.geolocation.georeference import geolocate_detection
 from src.geolocation.nav import NavFix
+from src.geolocation.postgis_export import write_postgis_sql
 from src.preprocessing.ingestion import SSSRecord, ingest_source
 from src.preprocessing.pipeline import PreprocessingPipeline
 from src.utils.config import get_logger, load_config
@@ -313,32 +314,56 @@ def _write_reports(db_path: Path, log_id: str, out_dir: Path) -> None:
     via the geolocation engine's own GeoJSON output method (src.geolocation.
     geojson_export) -- the same FeatureCollection GET /logs/{id}/map serves
     live, saved to disk so a log's geolocation results can be opened
-    directly in a GIS tool without going through the API."""
+    directly in a GIS tool without going through the API -- and
+    report.sql, a standalone PostGIS-loadable dump of the same detections
+    against this project's real `detections` table (src.geolocation.
+    postgis_export), for a demo/reviewer who wants that artifact without
+    standing up a live Postgres connection first."""
     with db.get_connection(db_path) as conn:
         detections = db.list_detections(conn, log_id)
+        log = db.get_log(conn, log_id)
+    pixels_to_meters = log.get("pixels_to_meters") if log else None
 
     geojson = write_geojson(out_dir / "report.geojson", detections, only_geolocated=True)
     logger.info("Wrote %s (%d geolocated feature(s) of %d total detection(s))",
                 out_dir / "report.geojson", len(geojson["features"]), len(detections))
 
-    report_rows = [{
-        "detection_id": d["id"],
-        "frame": d["frame_record_id"],
-        "class": d["class_name"],
-        "confidence_pct": d["confidence_score"],
-        "confidence_label": d["confidence_label"],
-        "bbox_px": [d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"]],
-        "lat": d["lat"],
-        "lon": d["lon"],
-        "location_known": d["geo_method"] == "nav_fix",
-    } for d in detections]
+    # resolved_dimensions_m prefers a detection's OWN stored length_m/width_m (the CSV
+    # geolocation engine's real geometry, computed from its own slant-range math -- see
+    # csv_engine.geolocate_csv_detection) over the generic bbox * pixels_to_meters guess,
+    # which only applies to image/YOLO-pipeline detections that never had real geometry
+    # computed for them. Resolved once here and reused for BOTH report.sql and
+    # report.json/report.csv below, so all three downloadable artifacts (and the live
+    # GET /logs/{id}/detections endpoint, which does the same resolution) agree with
+    # each other about every detection's size.
+    detections_with_dims = []
+    report_rows = []
+    for d in detections:
+        dims = class_taxonomy.resolved_dimensions_m(d, pixels_to_meters)
+        detections_with_dims.append({**d, "length_m": dims["length"], "width_m": dims["width"]})
+        report_rows.append({
+            "detection_id": d["id"],
+            "frame": d["frame_record_id"],
+            "class": d["class_name"],
+            "confidence_pct": d["confidence_score"],
+            "confidence_label": d["confidence_label"],
+            "bbox_px": [d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"]],
+            "length_m": dims["length"],
+            "width_m": dims["width"],
+            "height_m": dims["height"],
+            "lat": d["lat"],
+            "lon": d["lon"],
+            "location_known": d["geo_method"] == "nav_fix",
+        })
+
+    write_postgis_sql(out_dir / "report.sql", detections_with_dims)
 
     with open(out_dir / "report.json", "w") as f:
         json.dump({"log_id": log_id, "n_detections": len(report_rows), "detections": report_rows}, f, indent=2)
 
     with open(out_dir / "report.csv", "w", newline="") as f:
         fieldnames = ["detection_id", "frame", "class", "confidence_pct", "confidence_label",
-                      "bbox_px", "lat", "lon", "location_known"]
+                      "bbox_px", "length_m", "width_m", "height_m", "lat", "lon", "location_known"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(report_rows)

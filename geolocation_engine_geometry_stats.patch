@@ -1,0 +1,427 @@
+From 515f56e6eee693289895f1caf09b56fadf0425a7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 12 Sep 2026 18:49:35 +0000
+Subject: [PATCH] Store the geolocation engine's own length/width, don't
+ re-derive it
+
+The CSV geolocation engine (src/geolocation/csv_engine.py) already computes
+each detection's real-world length_m/width_m directly from its own slant-
+range geometry (bbox_w_px/bbox_h_px * range_per_pixel_m), but that result
+was being thrown away after insert -- GET /logs/{id}/detections and the
+report writers silently recomputed a size from a reconstructed bbox via the
+generic class_taxonomy.bbox_dimensions_m() helper instead, which uses a
+different bbox-axis convention than the engine itself. For CSV-sourced
+detections, the numbers the frontend showed were not what the geolocation
+engine actually calculated.
+
+- detections table (SQLite + PostGIS) gains length_m/width_m columns,
+  populated at insert time for CSV-engine detections (still NULL for
+  image/YOLO-pipeline detections, which have no equivalent physics-based
+  sizing step).
+- class_taxonomy.resolved_dimensions_m() is the new single source of truth:
+  prefers a detection's own stored length_m/width_m when present, falls
+  back to the existing bbox * pixels_to_meters estimate otherwise. Used by
+  GET /logs/{id}/detections, report.json/report.csv, and now report.sql
+  (which previously had no length_m/width_m columns at all).
+- csv_engine.py's _to_detection_row() now carries geo["length_m"]/
+  geo["width_m"] through into the stored row instead of discarding them.
+
+New/extended tests lock in that a CSV-engine detection's stored dimensions
+come back verbatim end-to-end (engine -> DB -> API -> report.sql), rather
+than being silently overwritten by the bbox-based fallback.
+
+36 passed, 2 warnings (backend/tests).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01E1cXxHLvxWsVApjc9w7bwH
+---
+ backend/src/backend/class_taxonomy.py         | 36 ++++++++++++++
+ backend/src/backend/db.py                     | 14 +++++-
+ backend/src/backend/db_postgis.py             | 15 ++++--
+ backend/src/backend/main.py                   | 18 ++++---
+ backend/src/backend/pipeline_runner.py        | 19 +++++---
+ backend/src/geolocation/csv_engine.py         |  5 ++
+ backend/src/geolocation/postgis_export.py     | 12 +++--
+ backend/tests/test_csv_geolocation_engine.py  | 17 ++++++-
+ .../tests/test_dimensions_and_sql_report.py   | 48 +++++++++++++++++++
+ 9 files changed, 156 insertions(+), 28 deletions(-)
+
+diff --git a/backend/src/backend/class_taxonomy.py b/backend/src/backend/class_taxonomy.py
+index a54bcb3..23dc149 100644
+--- a/backend/src/backend/class_taxonomy.py
++++ b/backend/src/backend/class_taxonomy.py
+@@ -125,3 +125,39 @@ def bbox_dimensions_m(bbox_x1: float, bbox_y1: float, bbox_x2: float, bbox_y2: f
+         width = round(abs(bbox_y2 - bbox_y1) * pixels_to_meters, 3)
+     height = ESTIMATED_HEIGHT_M.get(display_class, 1.0)
+     return {"length": length, "width": width, "height": height}
++
++
++def resolved_dimensions_m(detection: dict, pixels_to_meters: Optional[float]) -> dict:
++    """The single place every caller (GET /logs/{id}/detections, the JSON/CSV/
++    SQL report writers) should go for a detection's length/width/height --
++    NOT bbox_dimensions_m directly, which is a fallback this function calls
++    for you when needed.
++
++    PREFERS a detection's own stored length_m/width_m columns, when present,
++    over the generic bbox * pixels_to_meters guess below. Those columns are
++    only populated at insert time by an ingestion path that computed real-
++    world size itself from actual sonar geometry -- see
++    src/geolocation/csv_engine.py's geolocate_csv_detection, which derives
++    width from the across-track bbox extent and length from the along-track
++    extent using the same slant-range math it uses for lat/lon, not a bare
++    pixel-count heuristic. The image/YOLO pipeline has no equivalent physics
++    -based sizing step yet, so its detections have NULL length_m/width_m at
++    insert time and fall through to bbox_dimensions_m here, unchanged from
++    before this function existed.
++
++    Always returns a dict shaped like bbox_dimensions_m's ({length, width,
++    height}); height has no measured equivalent in either ingestion path and
++    is always the ESTIMATED_HEIGHT_M placeholder."""
++    display_class = display_classification(detection["class_name"])
++    stored_length = detection.get("length_m")
++    stored_width = detection.get("width_m")
++    if stored_length is not None and stored_width is not None:
++        return {
++            "length": stored_length,
++            "width": stored_width,
++            "height": ESTIMATED_HEIGHT_M.get(display_class, 1.0),
++        }
++    return bbox_dimensions_m(
++        detection["bbox_x1"], detection["bbox_y1"], detection["bbox_x2"], detection["bbox_y2"],
++        pixels_to_meters, display_class,
++    )
+diff --git a/backend/src/backend/db.py b/backend/src/backend/db.py
+index 93f54b7..6c4c7cc 100644
+--- a/backend/src/backend/db.py
++++ b/backend/src/backend/db.py
+@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS detections (
+     geo_method TEXT,                   -- 'nav_fix' | 'placeholder'
+     depth_m REAL,                      -- water depth below surface, NULL unless the nav
+                                         -- sidecar/XTF actually carried one (never fabricated)
++    length_m REAL, width_m REAL,       -- real-world debris size computed DIRECTLY by a
++                                        -- geolocation engine's own physics (see
++                                        -- src/geolocation/csv_engine.py's geolocate_csv_
++                                        -- detection); NULL for the image/YOLO pipeline, which
++                                        -- has no equivalent sizing step -- see class_taxonomy.
++                                        -- resolved_dimensions_m for the bbox-based fallback
++                                        -- every reader uses when these are NULL.
+     footprint_geojson TEXT,            -- JSON list of [lon, lat] pairs, the debris's 4-corner
+                                         -- real-world footprint polygon; NULL for placeholder
+                                         -- detections (see georeference.py's GeoResult.footprint)
+@@ -90,6 +97,8 @@ CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
+ _DETECTIONS_MIGRATIONS = [
+     ("depth_m", "REAL"),
+     ("footprint_geojson", "TEXT"),
++    ("length_m", "REAL"),
++    ("width_m", "REAL"),
+ ]
+ 
+ _LOG_MIGRATIONS = [
+@@ -211,14 +220,15 @@ def insert_detection(conn: sqlite3.Connection, det: dict[str, Any]) -> None:
+             id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
+             bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
+             confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
+-            lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at
+-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++            lat, lon, geo_method, depth_m, length_m, width_m, footprint_geojson, vae_panel_dir, created_at
++        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         (
+             det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
+             det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
+             *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
+             det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
+             det.get("lat"), det.get("lon"), det.get("geo_method"), det.get("depth_m"),
++            det.get("length_m"), det.get("width_m"),
+             det.get("footprint_geojson"), det.get("vae_panel_dir"), det["created_at"],
+         ),
+     )
+diff --git a/backend/src/backend/db_postgis.py b/backend/src/backend/db_postgis.py
+index 24a66f6..5b3bcf8 100644
+--- a/backend/src/backend/db_postgis.py
++++ b/backend/src/backend/db_postgis.py
+@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS detections (
+     lon DOUBLE PRECISION,
+     geo_method TEXT,
+     depth_m DOUBLE PRECISION,
++    length_m DOUBLE PRECISION,
++    width_m DOUBLE PRECISION,
+     footprint_geojson JSONB,
+     vae_panel_dir TEXT,
+     created_at TEXT NOT NULL,
+@@ -112,6 +114,8 @@ ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_inference_ms DOUBLE PRECISION
+ ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_frames INTEGER NOT NULL DEFAULT 0;
+ ALTER TABLE detections ADD COLUMN IF NOT EXISTS footprint_geojson JSONB;
+ ALTER TABLE detections ADD COLUMN IF NOT EXISTS geom_footprint geometry(Polygon, 4326);
++ALTER TABLE detections ADD COLUMN IF NOT EXISTS length_m DOUBLE PRECISION;
++ALTER TABLE detections ADD COLUMN IF NOT EXISTS width_m DOUBLE PRECISION;
+ """
+ 
+ # Everything in SCHEMA after the `CREATE EXTENSION` line -- used as a
+@@ -295,16 +299,17 @@ def insert_detection(conn, det: dict[str, Any]) -> None:
+                 id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
+                 bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
+                 confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
+-                lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at, geom, geom_footprint
+-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+-                      {geom_sql}, {footprint_geom_sql})""",
++                lat, lon, geo_method, depth_m, length_m, width_m, footprint_geojson, vae_panel_dir,
++                created_at, geom, geom_footprint
++            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
++                      %s, %s, %s, {geom_sql}, {footprint_geom_sql})""",
+             (
+                 det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
+                 det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
+                 *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
+                 det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
+-                lat, lon, det.get("geo_method"), det.get("depth_m"), footprint_col,
+-                det.get("vae_panel_dir"), det["created_at"], *geom_params, *footprint_geom_params,
++                lat, lon, det.get("geo_method"), det.get("depth_m"), det.get("length_m"), det.get("width_m"),
++                footprint_col, det.get("vae_panel_dir"), det["created_at"], *geom_params, *footprint_geom_params,
+             ),
+         )
+ 
+diff --git a/backend/src/backend/main.py b/backend/src/backend/main.py
+index 2bca60a..07d9454 100644
+--- a/backend/src/backend/main.py
++++ b/backend/src/backend/main.py
+@@ -490,16 +490,14 @@ def get_detections(log_id: str, min_confidence: Optional[float] = None) -> list[
+     with db.get_connection(DB_PATH) as conn:
+         rows = db.list_detections(conn, log_id, min_confidence=min_confidence)
+     for d in rows:
+-        display_class = class_taxonomy.display_classification(d["class_name"])
+-        dims = class_taxonomy.bbox_dimensions_m(
+-            d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"], pixels_to_meters, display_class,
+-        )
+-        # Real length/width when pixels_to_meters is known for this log (bbox size * that
+-        # scale -- same math as the /api/surveys/* layer's ApiDimensions, so the two stay
+-        # consistent); height is always class_taxonomy.ESTIMATED_HEIGHT_M's placeholder --
+-        # a 2D side-scan frame has no height axis to measure. dimensions_estimated is true
+-        # whenever length/width themselves are unknown (pixels_to_meters missing for this
+-        # log), not just because height always is.
++        # resolved_dimensions_m prefers a detection's OWN stored length_m/width_m (set at
++        # insert time by the CSV geolocation engine's real slant-range/ground-range math --
++        # see csv_engine.geolocate_csv_detection) over the generic bbox * pixels_to_meters
++        # guess, which only applies to image/YOLO-pipeline detections that never had real
++        # geometry computed for them. height is always class_taxonomy.ESTIMATED_HEIGHT_M's
++        # placeholder either way -- neither ingestion path measures a height axis.
++        # dimensions_estimated is true only when length/width themselves are unknown.
++        dims = class_taxonomy.resolved_dimensions_m(d, pixels_to_meters)
+         d["length_m"] = dims["length"]
+         d["width_m"] = dims["width"]
+         d["height_m"] = dims["height"]
+diff --git a/backend/src/backend/pipeline_runner.py b/backend/src/backend/pipeline_runner.py
+index 8b3dd18..ffbd1c2 100644
+--- a/backend/src/backend/pipeline_runner.py
++++ b/backend/src/backend/pipeline_runner.py
+@@ -328,14 +328,19 @@ def _write_reports(db_path: Path, log_id: str, out_dir: Path) -> None:
+     logger.info("Wrote %s (%d geolocated feature(s) of %d total detection(s))",
+                 out_dir / "report.geojson", len(geojson["features"]), len(detections))
+ 
+-    write_postgis_sql(out_dir / "report.sql", detections)
+-
++    # resolved_dimensions_m prefers a detection's OWN stored length_m/width_m (the CSV
++    # geolocation engine's real geometry, computed from its own slant-range math -- see
++    # csv_engine.geolocate_csv_detection) over the generic bbox * pixels_to_meters guess,
++    # which only applies to image/YOLO-pipeline detections that never had real geometry
++    # computed for them. Resolved once here and reused for BOTH report.sql and
++    # report.json/report.csv below, so all three downloadable artifacts (and the live
++    # GET /logs/{id}/detections endpoint, which does the same resolution) agree with
++    # each other about every detection's size.
++    detections_with_dims = []
+     report_rows = []
+     for d in detections:
+-        display_class = class_taxonomy.display_classification(d["class_name"])
+-        dims = class_taxonomy.bbox_dimensions_m(
+-            d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"], pixels_to_meters, display_class,
+-        )
++        dims = class_taxonomy.resolved_dimensions_m(d, pixels_to_meters)
++        detections_with_dims.append({**d, "length_m": dims["length"], "width_m": dims["width"]})
+         report_rows.append({
+             "detection_id": d["id"],
+             "frame": d["frame_record_id"],
+@@ -351,6 +356,8 @@ def _write_reports(db_path: Path, log_id: str, out_dir: Path) -> None:
+             "location_known": d["geo_method"] == "nav_fix",
+         })
+ 
++    write_postgis_sql(out_dir / "report.sql", detections_with_dims)
++
+     with open(out_dir / "report.json", "w") as f:
+         json.dump({"log_id": log_id, "n_detections": len(report_rows), "detections": report_rows}, f, indent=2)
+ 
+diff --git a/backend/src/geolocation/csv_engine.py b/backend/src/geolocation/csv_engine.py
+index b7e3804..e194798 100644
+--- a/backend/src/geolocation/csv_engine.py
++++ b/backend/src/geolocation/csv_engine.py
+@@ -191,6 +191,11 @@ def _to_detection_row(geo: dict, log_id: str, frame_index: int, created_at: str)
+         "geo_method": "nav_fix",  # every row here had a matched nav fix by construction --
+         # rows with no nav match are skipped before this point, see run_csv_pipeline_to_detections
+         "depth_m": geo["depth_m"],
++        "length_m": geo["length_m"],  # THIS engine's own real-world size, computed directly from
++        "width_m": geo["width_m"],    # bbox_w_px/bbox_h_px * range_per_pixel_m in geolocate_csv_
++        # detection above -- stored as-is so downstream readers (GET /logs/{id}/detections, the
++        # report writers) use it instead of re-deriving a size from a reconstructed bbox (see
++        # class_taxonomy.resolved_dimensions_m, which prefers these columns when they're set).
+         "footprint_geojson": None,  # no pixel_y in this format -- see module docstring
+         "vae_panel_dir": None,
+         "created_at": created_at,
+diff --git a/backend/src/geolocation/postgis_export.py b/backend/src/geolocation/postgis_export.py
+index fd17b82..343bc99 100644
+--- a/backend/src/geolocation/postgis_export.py
++++ b/backend/src/geolocation/postgis_export.py
+@@ -17,8 +17,9 @@ sync BY HAND with db_postgis.py's SCHEMA constant (detections table only)
+ -- if that schema changes, update both.
+ 
+ Every detection becomes one INSERT against the REAL `detections` table this
+-project actually uses (confidence breakdown, VAE fields, footprint polygon,
+-geom/geom_footprint) -- NOT the placeholder `marine_debris` table the
++project actually uses (confidence breakdown, VAE fields, real-world
++length_m/width_m geometry, footprint polygon, geom/geom_footprint) -- NOT
++the placeholder `marine_debris` table the
+ originally-uploaded standalone geolocation_engine.py script produced (see
+ csv_engine.py's module docstring for that script's own `--load-postgis`
+ behavior, preserved there unchanged for CLI parity). A demo/report artifact
+@@ -58,6 +59,8 @@ CREATE TABLE IF NOT EXISTS detections (
+     lon DOUBLE PRECISION,
+     geo_method TEXT,
+     depth_m DOUBLE PRECISION,
++    length_m DOUBLE PRECISION,
++    width_m DOUBLE PRECISION,
+     footprint_geojson JSONB,
+     vae_panel_dir TEXT,
+     created_at TEXT NOT NULL,
+@@ -74,8 +77,8 @@ _DETECTIONS_COLUMNS = [
+     "id", "log_id", "frame_index", "frame_record_id", "frame_image_path", "class_name", "yolo_conf",
+     "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "confidence_score", "confidence_label",
+     "confidence_breakdown", "vae_box_error", "vae_whole_image_error", "vae_whole_image_percentile",
+-    "lat", "lon", "geo_method", "depth_m", "footprint_geojson", "vae_panel_dir", "created_at",
+-    "geom", "geom_footprint",
++    "lat", "lon", "geo_method", "depth_m", "length_m", "width_m", "footprint_geojson",
++    "vae_panel_dir", "created_at", "geom", "geom_footprint",
+ ]
+ 
+ 
+@@ -130,6 +133,7 @@ def build_postgis_sql(detections: list[dict[str, Any]]) -> str:
+             _sql_jsonb(d.get("confidence_breakdown")), _sql_num(d.get("vae_box_error")),
+             _sql_num(d.get("vae_whole_image_error")), _sql_num(d.get("vae_whole_image_percentile")),
+             _sql_num(d.get("lat")), _sql_num(d.get("lon")), _sql_str(d.get("geo_method")), _sql_num(d.get("depth_m")),
++            _sql_num(d.get("length_m")), _sql_num(d.get("width_m")),
+             _sql_jsonb(d.get("footprint_geojson")), _sql_str(d.get("vae_panel_dir")), _sql_str(d.get("created_at")),
+             _geom_expr(d.get("lat"), d.get("lon")), _geom_footprint_expr(d.get("footprint_geojson")),
+         ]
+diff --git a/backend/tests/test_csv_geolocation_engine.py b/backend/tests/test_csv_geolocation_engine.py
+index fcd24f5..e7247b5 100644
+--- a/backend/tests/test_csv_geolocation_engine.py
++++ b/backend/tests/test_csv_geolocation_engine.py
+@@ -101,13 +101,21 @@ class RunCsvPipelineToDetectionsTests(unittest.TestCase):
+         row = rows[0]
+         for key in ("id", "log_id", "frame_index", "frame_record_id", "class_name", "yolo_conf", "bbox",
+                     "confidence_score", "confidence_label", "lat", "lon", "geo_method", "depth_m",
+-                    "footprint_geojson", "created_at"):
++                    "length_m", "width_m", "footprint_geojson", "created_at"):
+             self.assertIn(key, row)
+         self.assertEqual(row["log_id"], "log-1")
+         self.assertEqual(row["geo_method"], "nav_fix")
+         self.assertIsNone(row["footprint_geojson"])
+         self.assertAlmostEqual(row["depth_m"], 60.0, places=2)
+         self.assertEqual(len(row["bbox"]), 4)
++        # This engine's own geometry stats (see GeolocateCsvDetectionMathTests'
++        # worked example: bbox_w=80px, bbox_h=30px, range_per_pixel=0.05 ->
++        # width_m=4.0, length_m=1.5) must survive into the row unchanged -- this
++        # is what makes it into the `detections` table's length_m/width_m
++        # columns, so downstream readers use the engine's real math instead of
++        # re-deriving a size from the reconstructed bbox.
++        self.assertAlmostEqual(row["width_m"], 4.0, places=2)
++        self.assertAlmostEqual(row["length_m"], 1.5, places=2)
+ 
+ 
+ @unittest.skipUnless(_MAIN_IMPORTABLE, f"src.backend.main not importable ({_MAIN_IMPORT_ERROR})")
+@@ -157,6 +165,13 @@ class GeolocateCsvEndpointTests(unittest.TestCase):
+         detections = self.client.get(f"/logs/{log_id}/detections").json()
+         self.assertEqual(len(detections), 1)
+         self.assertAlmostEqual(detections[0]["depth_m"], 60.0, places=2)
++        # The whole point of storing length_m/width_m on the row at insert time:
++        # GET /logs/{id}/detections must return THIS engine's own real-world
++        # size (see the worked example above), not a bbox-diff guess computed
++        # from the reconstructed bbox against some unrelated pixels_to_meters.
++        self.assertAlmostEqual(detections[0]["width_m"], 4.0, places=2)
++        self.assertAlmostEqual(detections[0]["length_m"], 1.5, places=2)
++        self.assertFalse(detections[0]["dimensions_estimated"])
+ 
+         map_fc = self.client.get(f"/logs/{log_id}/map").json()
+         self.assertEqual(len(map_fc["features"]), 1)
+diff --git a/backend/tests/test_dimensions_and_sql_report.py b/backend/tests/test_dimensions_and_sql_report.py
+index f192653..62c37d2 100644
+--- a/backend/tests/test_dimensions_and_sql_report.py
++++ b/backend/tests/test_dimensions_and_sql_report.py
+@@ -20,6 +20,7 @@ class PostgisSqlExportTests(unittest.TestCase):
+             "confidence_score": 91.0, "confidence_label": "high", "confidence_breakdown": {"yolo_points": 63.0},
+             "vae_box_error": None, "vae_whole_image_error": None, "vae_whole_image_percentile": None,
+             "lat": 19.0012, "lon": 72.8015, "geo_method": "nav_fix", "depth_m": 60.0,
++            "length_m": 1.5, "width_m": 4.0,
+             "footprint_geojson": [[72.80, 19.00], [72.81, 19.00], [72.81, 19.01], [72.80, 19.01], [72.80, 19.00]],
+             "vae_panel_dir": None, "created_at": "2026-01-01T00:00:00Z",
+         }
+@@ -54,6 +55,27 @@ class PostgisSqlExportTests(unittest.TestCase):
+         self.assertTrue(insert_line.rstrip(";").endswith(", NULL)"))
+         self.assertIn("ST_MakePoint", insert_line)  # sanity: geom itself IS populated here
+ 
++    def test_length_width_columns_carry_the_geolocation_engines_own_numbers(self):
++        # The whole point of adding these columns: a CSV-engine-sourced detection's real
++        # length_m/width_m (computed by csv_engine.geolocate_csv_detection, not a bbox
++        # guess) must land in the SQL dump as plain numeric literals, not JSON/NULL.
++        sql = build_postgis_sql([self._detection(length_m=1.5, width_m=4.0)])
++        self.assertIn("CREATE TABLE IF NOT EXISTS detections", sql)
++        self.assertIn("length_m DOUBLE PRECISION", sql)
++        self.assertIn("width_m DOUBLE PRECISION", sql)
++        insert_line = [line for line in sql.splitlines() if line.startswith("INSERT")][0]
++        self.assertIn("1.5", insert_line)
++        self.assertIn("4.0", insert_line)
++
++    def test_length_width_null_when_not_computed(self):
++        # An image/YOLO-pipeline detection has no length_m/width_m of its own at insert
++        # time (see class_taxonomy.resolved_dimensions_m's fallback) -- must dump as SQL
++        # NULL, never a fabricated 0.0.
++        sql = build_postgis_sql([self._detection(length_m=None, width_m=None)])
++        insert_line = [line for line in sql.splitlines() if line.startswith("INSERT")][0]
++        values = insert_line.split("VALUES (", 1)[1]
++        self.assertIn("NULL", values)
++
+ 
+ class DetectionsEndpointDimensionsTests(unittest.TestCase):
+     """GET /logs/{id}/detections now includes length_m/width_m/height_m --
+@@ -103,6 +125,32 @@ class DetectionsEndpointDimensionsTests(unittest.TestCase):
+         self.assertIsNone(det["width_m"])
+         self.assertTrue(det["dimensions_estimated"])
+ 
++    def test_stored_engine_dimensions_win_over_bbox_recompute(self):
++        # A detection that already has its own length_m/width_m (set at insert time by
++        # the CSV geolocation engine's real slant-range/ground-range math) must come back
++        # from GET /logs/{id}/detections EXACTLY as stored -- not silently overwritten by
++        # the generic bbox * pixels_to_meters guess, which uses a different axis
++        # convention (see class_taxonomy.resolved_dimensions_m). A large pixels_to_meters
++        # is deliberately set on this log so a bbox-based recompute would produce very
++        # different numbers if it were (wrongly) still in charge.
++        log_id = "log-3"
++        with db.get_connection(main.DB_PATH) as conn:
++            db.create_log(conn, log_id, "fixture.csv", "csv_detections", "2026-01-01T00:00:00Z",
++                           pixels_to_meters=0.05)
++            db.insert_detection(conn, {
++                "id": "d1", "log_id": log_id, "frame_index": 0, "frame_record_id": "P0001",
++                "class_name": "pipe", "yolo_conf": 0.9, "bbox": [1410.0, 0.0, 1490.0, 30.0],
++                "confidence_score": 91.0, "confidence_label": "high",
++                "lat": 19.0011, "lon": 72.8016, "geo_method": "nav_fix",
++                "length_m": 1.5, "width_m": 4.0,  # the engine's own numbers
++                "created_at": "2026-01-01T00:00:00Z",
++            })
++        detections = self.client.get(f"/logs/{log_id}/detections").json()
++        det = detections[0]
++        self.assertEqual(det["length_m"], 1.5)
++        self.assertEqual(det["width_m"], 4.0)
++        self.assertFalse(det["dimensions_estimated"])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

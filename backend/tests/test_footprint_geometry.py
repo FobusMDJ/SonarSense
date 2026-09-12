@@ -3,13 +3,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
-from src.backend import db_backend as db
-from src.backend import main
 from src.geolocation.georeference import geolocate_detection
 from src.geolocation.geojson_export import build_geojson
 from src.geolocation.nav import NavFix
+
+# main.py pulls in the full backend (torch, cv2, ...) just to import it --
+# not needed for the math-only tests below, and not always installed (e.g.
+# a lightweight dev machine that hasn't set up the ML deps yet). Guarded so
+# a missing torch/cv2 only skips the one API-level test class further down,
+# instead of failing collection for this entire file.
+try:
+    from fastapi.testclient import TestClient
+    from src.backend import db_backend as db
+    from src.backend import main
+    _MAIN_IMPORTABLE = True
+    _MAIN_IMPORT_ERROR = None
+except ImportError as exc:
+    _MAIN_IMPORTABLE = False
+    _MAIN_IMPORT_ERROR = exc
 
 
 class FootprintGeometryTests(unittest.TestCase):
@@ -79,6 +90,7 @@ class FootprintGeometryTests(unittest.TestCase):
             self.assertFalse(fc["features"][0]["properties"]["has_footprint"])
 
 
+@unittest.skipUnless(_MAIN_IMPORTABLE, f"src.backend.main not importable ({_MAIN_IMPORT_ERROR})")
 class MapEndpointGeometryModeTests(unittest.TestCase):
     """GET /logs/{log_id}/map's `geometry_mode` query param (see main.py's
     get_map_geojson) -- exercises the live API, not just build_geojson()
@@ -86,7 +98,7 @@ class MapEndpointGeometryModeTests(unittest.TestCase):
     swallowed ValueError, etc.) would actually be caught here."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._orig_db_path = main.DB_PATH
         main.DB_PATH = Path(self._tmp.name) / "test_map.db"
 

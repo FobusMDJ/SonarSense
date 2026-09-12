@@ -24,6 +24,7 @@ Endpoints (all under this one app):
   GET    /logs/{log_id}/report.json             downloadable JSON report
   GET    /logs/{log_id}/report.csv              downloadable CSV report
   GET    /logs/{log_id}/report.geojson          downloadable GeoJSON (same content as /map)
+  GET    /logs/{log_id}/report.sql              downloadable PostGIS SQL dump of this log's detections
   GET    /logs/{log_id}/frames/{frame}/vae/{f}  one of the 7 VAE output PNGs for one frame
   WS     /ws/logs/{log_id}                      live progress events while a log processes
 """
@@ -46,7 +47,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, W
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.backend import db_backend as db
+from src.backend import class_taxonomy, db_backend as db
 from src.backend.api_routes import router as frontend_api_router
 from src.backend.archive_ingestion import extract_survey_zip
 from src.backend.pipeline_runner import _write_reports, process_log
@@ -484,9 +485,24 @@ def get_log(log_id: str) -> dict:
 
 @app.get("/logs/{log_id}/detections", response_model=list[Detection])
 def get_detections(log_id: str, min_confidence: Optional[float] = None) -> list[dict]:
-    _require_log(log_id)
+    log = _require_log(log_id)
+    pixels_to_meters = log.get("pixels_to_meters")
     with db.get_connection(DB_PATH) as conn:
-        return db.list_detections(conn, log_id, min_confidence=min_confidence)
+        rows = db.list_detections(conn, log_id, min_confidence=min_confidence)
+    for d in rows:
+        # resolved_dimensions_m prefers a detection's OWN stored length_m/width_m (set at
+        # insert time by the CSV geolocation engine's real slant-range/ground-range math --
+        # see csv_engine.geolocate_csv_detection) over the generic bbox * pixels_to_meters
+        # guess, which only applies to image/YOLO-pipeline detections that never had real
+        # geometry computed for them. height is always class_taxonomy.ESTIMATED_HEIGHT_M's
+        # placeholder either way -- neither ingestion path measures a height axis.
+        # dimensions_estimated is true only when length/width themselves are unknown.
+        dims = class_taxonomy.resolved_dimensions_m(d, pixels_to_meters)
+        d["length_m"] = dims["length"]
+        d["width_m"] = dims["width"]
+        d["height_m"] = dims["height"]
+        d["dimensions_estimated"] = dims["length"] is None or dims["width"] is None
+    return rows
 
 
 def _require_log(log_id: str) -> dict:
@@ -672,6 +688,21 @@ def get_report_geojson(log_id: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "Report not ready yet -- log may still be processing.")
     return FileResponse(str(path), media_type="application/geo+json", filename=f"{log_id}_report.geojson")
+
+
+@app.get("/logs/{log_id}/report.sql")
+def get_report_sql(log_id: str) -> FileResponse:
+    """Standalone PostGIS-loadable dump of this log's detections (src.
+    geolocation.postgis_export), written to disk by _write_reports at the
+    end of processing -- for the "GeoJSON -> PostGIS" step in the reference
+    pitch deck as an actual downloadable artifact, without needing a live
+    Postgres connection just to inspect it (works regardless of whether
+    this deployment's own db_backend is sqlite or postgres)."""
+    _require_log(log_id)
+    path = OUTPUT_DIR / log_id / "report.sql"
+    if not path.exists():
+        raise HTTPException(404, "Report not ready yet -- log may still be processing.")
+    return FileResponse(str(path), media_type="application/sql", filename=f"{log_id}_report.sql")
 
 
 # --------------------------------------------------------------------------

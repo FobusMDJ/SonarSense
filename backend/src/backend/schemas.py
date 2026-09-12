@@ -69,6 +69,14 @@ class Detection(BaseModel):
     # GeoResult.footprint), null under the exact same rule as lat/lon: no nav fix, no shape.
     vae_panel_dir: Optional[str] = None
     created_at: str
+    length_m: Optional[float] = None  # bbox size (across-track) * this log's pixels_to_meters --
+    width_m: Optional[float] = None   # null (not 0.0) when pixels_to_meters is unknown for this log,
+    # so a consumer can't mistake "not measured" for "measured zero" (see class_taxonomy.
+    # bbox_dimensions_m, the same helper the /api/surveys/* layer's ApiDimensions already used).
+    height_m: Optional[float] = None  # ALWAYS class_taxonomy.ESTIMATED_HEIGHT_M's placeholder --
+    # a 2D side-scan frame has no height axis to measure directly.
+    dimensions_estimated: bool = False  # true when length_m/width_m themselves are null
+    # (pixels_to_meters unknown for this log) -- height_m is a placeholder either way.
 
 
 class ModelOutputStats(BaseModel):

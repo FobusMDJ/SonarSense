@@ -1,0 +1,651 @@
+From 0f5ff43afee27e0c2151b1d529d17c9395fa8873 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 12 Sep 2026 18:22:49 +0000
+Subject: [PATCH] Add PostGIS SQL report download, surface debris dimensions
+ end-to-end
+
+- New GET /logs/{log_id}/report.sql, backed by src/geolocation/postgis_export.py,
+  which dumps a standalone .sql file against the real detections table (not the
+  toy marine_debris table from the original standalone script) -- loadable via
+  `psql -f report.sql` without a live Postgres connection.
+- GET /logs/{log_id}/detections now attaches length_m/width_m/height_m/
+  dimensions_estimated per row (via class_taxonomy.bbox_dimensions_m), closing
+  the gap where the live dashboard had no dimension data to show at all.
+- report.json/report.csv also gained length_m/width_m/height_m columns.
+- Frontend: api.ts/data.ts carry the new fields through, Dashboard.tsx's
+  DetailDialog (the actual live detection popup) now shows Length/Width/Height,
+  and ReportsView gained a SQL download button next to CSV/JSON/GeoJSON/PDF.
+- Guarded the two geometry test files' src.backend.main import so a missing
+  torch/cv2 only skips their API-level test classes instead of failing
+  collection for the whole file.
+
+33 passed, 2 warnings (backend/tests). Frontend type-checks clean (tsc --noEmit).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01E1cXxHLvxWsVApjc9w7bwH
+---
+ backend/src/backend/main.py                   |  39 ++++-
+ backend/src/backend/pipeline_runner.py        |  46 ++++--
+ backend/src/backend/schemas.py                |   8 +
+ backend/src/geolocation/postgis_export.py     | 148 ++++++++++++++++++
+ backend/tests/test_csv_geolocation_engine.py  |  21 ++-
+ .../tests/test_dimensions_and_sql_report.py   | 108 +++++++++++++
+ backend/tests/test_footprint_geometry.py      |  20 ++-
+ src/dashboard/Dashboard.tsx                   |   6 +-
+ src/dashboard/data.ts                         |  12 +-
+ src/lib/api.ts                                |   5 +
+ 10 files changed, 385 insertions(+), 28 deletions(-)
+ create mode 100644 backend/src/geolocation/postgis_export.py
+ create mode 100644 backend/tests/test_dimensions_and_sql_report.py
+
+diff --git a/backend/src/backend/main.py b/backend/src/backend/main.py
+index fa2a44a..2bca60a 100644
+--- a/backend/src/backend/main.py
++++ b/backend/src/backend/main.py
+@@ -24,6 +24,7 @@ Endpoints (all under this one app):
+   GET    /logs/{log_id}/report.json             downloadable JSON report
+   GET    /logs/{log_id}/report.csv              downloadable CSV report
+   GET    /logs/{log_id}/report.geojson          downloadable GeoJSON (same content as /map)
++  GET    /logs/{log_id}/report.sql              downloadable PostGIS SQL dump of this log's detections
+   GET    /logs/{log_id}/frames/{frame}/vae/{f}  one of the 7 VAE output PNGs for one frame
+   WS     /ws/logs/{log_id}                      live progress events while a log processes
+ """
+@@ -46,7 +47,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, W
+ from fastapi.responses import FileResponse, Response
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+-from src.backend import db_backend as db
++from src.backend import class_taxonomy, db_backend as db
+ from src.backend.api_routes import router as frontend_api_router
+ from src.backend.archive_ingestion import extract_survey_zip
+ from src.backend.pipeline_runner import _write_reports, process_log
+@@ -484,9 +485,26 @@ def get_log(log_id: str) -> dict:
+ 
+ @app.get("/logs/{log_id}/detections", response_model=list[Detection])
+ def get_detections(log_id: str, min_confidence: Optional[float] = None) -> list[dict]:
+-    _require_log(log_id)
++    log = _require_log(log_id)
++    pixels_to_meters = log.get("pixels_to_meters")
+     with db.get_connection(DB_PATH) as conn:
+-        return db.list_detections(conn, log_id, min_confidence=min_confidence)
++        rows = db.list_detections(conn, log_id, min_confidence=min_confidence)
++    for d in rows:
++        display_class = class_taxonomy.display_classification(d["class_name"])
++        dims = class_taxonomy.bbox_dimensions_m(
++            d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"], pixels_to_meters, display_class,
++        )
++        # Real length/width when pixels_to_meters is known for this log (bbox size * that
++        # scale -- same math as the /api/surveys/* layer's ApiDimensions, so the two stay
++        # consistent); height is always class_taxonomy.ESTIMATED_HEIGHT_M's placeholder --
++        # a 2D side-scan frame has no height axis to measure. dimensions_estimated is true
++        # whenever length/width themselves are unknown (pixels_to_meters missing for this
++        # log), not just because height always is.
++        d["length_m"] = dims["length"]
++        d["width_m"] = dims["width"]
++        d["height_m"] = dims["height"]
++        d["dimensions_estimated"] = dims["length"] is None or dims["width"] is None
++    return rows
+ 
+ 
+ def _require_log(log_id: str) -> dict:
+@@ -674,6 +692,21 @@ def get_report_geojson(log_id: str) -> FileResponse:
+     return FileResponse(str(path), media_type="application/geo+json", filename=f"{log_id}_report.geojson")
+ 
+ 
++@app.get("/logs/{log_id}/report.sql")
++def get_report_sql(log_id: str) -> FileResponse:
++    """Standalone PostGIS-loadable dump of this log's detections (src.
++    geolocation.postgis_export), written to disk by _write_reports at the
++    end of processing -- for the "GeoJSON -> PostGIS" step in the reference
++    pitch deck as an actual downloadable artifact, without needing a live
++    Postgres connection just to inspect it (works regardless of whether
++    this deployment's own db_backend is sqlite or postgres)."""
++    _require_log(log_id)
++    path = OUTPUT_DIR / log_id / "report.sql"
++    if not path.exists():
++        raise HTTPException(404, "Report not ready yet -- log may still be processing.")
++    return FileResponse(str(path), media_type="application/sql", filename=f"{log_id}_report.sql")
++
++
+ # --------------------------------------------------------------------------
+ # live progress
+ # --------------------------------------------------------------------------
+diff --git a/backend/src/backend/pipeline_runner.py b/backend/src/backend/pipeline_runner.py
+index 9204f3c..8b3dd18 100644
+--- a/backend/src/backend/pipeline_runner.py
++++ b/backend/src/backend/pipeline_runner.py
+@@ -58,12 +58,13 @@ from typing import Callable, Optional
+ import numpy as np
+ import torch
+ 
+-from src.backend import db_backend as db
++from src.backend import class_taxonomy, db_backend as db
+ from src.backend.model_release import INFERENCE_LOCK, JOB_LOCK, get_vae_model, get_yolo_model
+ from src.confidence.scoring import score_detection
+ from src.geolocation.geojson_export import write_geojson
+ from src.geolocation.georeference import geolocate_detection
+ from src.geolocation.nav import NavFix
++from src.geolocation.postgis_export import write_postgis_sql
+ from src.preprocessing.ingestion import SSSRecord, ingest_source
+ from src.preprocessing.pipeline import PreprocessingPipeline
+ from src.utils.config import get_logger, load_config
+@@ -313,32 +314,49 @@ def _write_reports(db_path: Path, log_id: str, out_dir: Path) -> None:
+     via the geolocation engine's own GeoJSON output method (src.geolocation.
+     geojson_export) -- the same FeatureCollection GET /logs/{id}/map serves
+     live, saved to disk so a log's geolocation results can be opened
+-    directly in a GIS tool without going through the API."""
++    directly in a GIS tool without going through the API -- and
++    report.sql, a standalone PostGIS-loadable dump of the same detections
++    against this project's real `detections` table (src.geolocation.
++    postgis_export), for a demo/reviewer who wants that artifact without
++    standing up a live Postgres connection first."""
+     with db.get_connection(db_path) as conn:
+         detections = db.list_detections(conn, log_id)
++        log = db.get_log(conn, log_id)
++    pixels_to_meters = log.get("pixels_to_meters") if log else None
+ 
+     geojson = write_geojson(out_dir / "report.geojson", detections, only_geolocated=True)
+     logger.info("Wrote %s (%d geolocated feature(s) of %d total detection(s))",
+                 out_dir / "report.geojson", len(geojson["features"]), len(detections))
+ 
+-    report_rows = [{
+-        "detection_id": d["id"],
+-        "frame": d["frame_record_id"],
+-        "class": d["class_name"],
+-        "confidence_pct": d["confidence_score"],
+-        "confidence_label": d["confidence_label"],
+-        "bbox_px": [d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"]],
+-        "lat": d["lat"],
+-        "lon": d["lon"],
+-        "location_known": d["geo_method"] == "nav_fix",
+-    } for d in detections]
++    write_postgis_sql(out_dir / "report.sql", detections)
++
++    report_rows = []
++    for d in detections:
++        display_class = class_taxonomy.display_classification(d["class_name"])
++        dims = class_taxonomy.bbox_dimensions_m(
++            d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"], pixels_to_meters, display_class,
++        )
++        report_rows.append({
++            "detection_id": d["id"],
++            "frame": d["frame_record_id"],
++            "class": d["class_name"],
++            "confidence_pct": d["confidence_score"],
++            "confidence_label": d["confidence_label"],
++            "bbox_px": [d["bbox_x1"], d["bbox_y1"], d["bbox_x2"], d["bbox_y2"]],
++            "length_m": dims["length"],
++            "width_m": dims["width"],
++            "height_m": dims["height"],
++            "lat": d["lat"],
++            "lon": d["lon"],
++            "location_known": d["geo_method"] == "nav_fix",
++        })
+ 
+     with open(out_dir / "report.json", "w") as f:
+         json.dump({"log_id": log_id, "n_detections": len(report_rows), "detections": report_rows}, f, indent=2)
+ 
+     with open(out_dir / "report.csv", "w", newline="") as f:
+         fieldnames = ["detection_id", "frame", "class", "confidence_pct", "confidence_label",
+-                      "bbox_px", "lat", "lon", "location_known"]
++                      "bbox_px", "length_m", "width_m", "height_m", "lat", "lon", "location_known"]
+         writer = csv.DictWriter(f, fieldnames=fieldnames)
+         writer.writeheader()
+         writer.writerows(report_rows)
+diff --git a/backend/src/backend/schemas.py b/backend/src/backend/schemas.py
+index 94e7e21..c2c0714 100644
+--- a/backend/src/backend/schemas.py
++++ b/backend/src/backend/schemas.py
+@@ -69,6 +69,14 @@ class Detection(BaseModel):
+     # GeoResult.footprint), null under the exact same rule as lat/lon: no nav fix, no shape.
+     vae_panel_dir: Optional[str] = None
+     created_at: str
++    length_m: Optional[float] = None  # bbox size (across-track) * this log's pixels_to_meters --
++    width_m: Optional[float] = None   # null (not 0.0) when pixels_to_meters is unknown for this log,
++    # so a consumer can't mistake "not measured" for "measured zero" (see class_taxonomy.
++    # bbox_dimensions_m, the same helper the /api/surveys/* layer's ApiDimensions already used).
++    height_m: Optional[float] = None  # ALWAYS class_taxonomy.ESTIMATED_HEIGHT_M's placeholder --
++    # a 2D side-scan frame has no height axis to measure directly.
++    dimensions_estimated: bool = False  # true when length_m/width_m themselves are null
++    # (pixels_to_meters unknown for this log) -- height_m is a placeholder either way.
+ 
+ 
+ class ModelOutputStats(BaseModel):
+diff --git a/backend/src/geolocation/postgis_export.py b/backend/src/geolocation/postgis_export.py
+new file mode 100644
+index 0000000..fd17b82
+--- /dev/null
++++ b/backend/src/geolocation/postgis_export.py
+@@ -0,0 +1,148 @@
++"""Generates a standalone, PostGIS-loadable `.sql` dump of one log's
++detections -- the downloadable artifact for GET /logs/{log_id}/report.sql.
++
++WHY THIS EXISTS: the reference pitch deck's step 9 ("GEOSPATIAL DATABASE")
++shows GeoJSON -> PostGIS explicitly, and this project's own db_postgis.py
++already implements that as a LIVE connection (when config/backend.yaml sets
++db_backend: postgres). But there was no way to get a `.sql` file out of a
++log for someone who just wants to inspect/replay it later (`psql -f
++report.sql`) without standing up a live Postgres connection first. This
++module is that missing piece.
++
++DOES NOT import db_postgis.py on purpose: db_postgis.py hard-requires
++psycopg2, but SQLite (db_backend: sqlite) is this project's zero-setup
++default, and report generation must keep working for every log regardless
++of which backend is actually configured. The CREATE TABLE below is kept in
++sync BY HAND with db_postgis.py's SCHEMA constant (detections table only)
++-- if that schema changes, update both.
++
++Every detection becomes one INSERT against the REAL `detections` table this
++project actually uses (confidence breakdown, VAE fields, footprint polygon,
++geom/geom_footprint) -- NOT the placeholder `marine_debris` table the
++originally-uploaded standalone geolocation_engine.py script produced (see
++csv_engine.py's module docstring for that script's own `--load-postgis`
++behavior, preserved there unchanged for CLI parity). A demo/report artifact
++should show this project's real schema, not a toy one.
++
++Values are inlined as SQL literals, not parameterized -- this is a static
++file meant to be replayed later by `psql`, not executed by this process.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++# Kept in sync BY HAND with db_postgis.py's SCHEMA (detections table only) --
++# see module docstring for why this isn't just imported from there.
++CREATE_DETECTIONS_TABLE_SQL = """CREATE EXTENSION IF NOT EXISTS postgis;
++
++CREATE TABLE IF NOT EXISTS detections (
++    id TEXT PRIMARY KEY,
++    log_id TEXT NOT NULL,
++    frame_index INTEGER NOT NULL,
++    frame_record_id TEXT NOT NULL,
++    frame_image_path TEXT,
++    class_name TEXT NOT NULL,
++    yolo_conf DOUBLE PRECISION NOT NULL,
++    bbox_x1 DOUBLE PRECISION, bbox_y1 DOUBLE PRECISION,
++    bbox_x2 DOUBLE PRECISION, bbox_y2 DOUBLE PRECISION,
++    confidence_score DOUBLE PRECISION NOT NULL,
++    confidence_label TEXT NOT NULL,
++    confidence_breakdown JSONB,
++    vae_box_error DOUBLE PRECISION,
++    vae_whole_image_error DOUBLE PRECISION,
++    vae_whole_image_percentile DOUBLE PRECISION,
++    lat DOUBLE PRECISION,
++    lon DOUBLE PRECISION,
++    geo_method TEXT,
++    depth_m DOUBLE PRECISION,
++    footprint_geojson JSONB,
++    vae_panel_dir TEXT,
++    created_at TEXT NOT NULL,
++    geom geometry(Point, 4326),
++    geom_footprint geometry(Polygon, 4326)
++);
++
++CREATE INDEX IF NOT EXISTS idx_detections_log_id ON detections(log_id);
++CREATE INDEX IF NOT EXISTS idx_detections_geom ON detections USING GIST(geom);
++CREATE INDEX IF NOT EXISTS idx_detections_geom_footprint ON detections USING GIST(geom_footprint);
++"""
++
++_DETECTIONS_COLUMNS = [
++    "id", "log_id", "frame_index", "frame_record_id", "frame_image_path", "class_name", "yolo_conf",
++    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "confidence_score", "confidence_label",
++    "confidence_breakdown", "vae_box_error", "vae_whole_image_error", "vae_whole_image_percentile",
++    "lat", "lon", "geo_method", "depth_m", "footprint_geojson", "vae_panel_dir", "created_at",
++    "geom", "geom_footprint",
++]
++
++
++def _sql_str(value: Any) -> str:
++    """NULL for None, a single-quoted/escaped SQL string literal otherwise."""
++    return "NULL" if value is None else "'" + str(value).replace("'", "''") + "'"
++
++
++def _sql_num(value: Any) -> str:
++    return "NULL" if value is None else repr(float(value))
++
++
++def _sql_jsonb(value: Any) -> str:
++    if value is None:
++        return "NULL"
++    payload = value if isinstance(value, str) else json.dumps(value)  # already-encoded JSON text
++    # (e.g. footprint_geojson/confidence_breakdown as stored) passes through as-is; a plain
++    # dict/list gets encoded here.
++    return "'" + payload.replace("'", "''") + "'::jsonb"
++
++
++def _geom_expr(lat: Any, lon: Any) -> str:
++    if lat is None or lon is None or (float(lat) == 0.0 and float(lon) == 0.0):
++        return "NULL"  # placeholder detections never get a real point -- same rule as db_postgis.py
++    return f"ST_SetSRID(ST_MakePoint({float(lon)!r}, {float(lat)!r}), 4326)"
++
++
++def _geom_footprint_expr(footprint_geojson: Any) -> str:
++    ring = footprint_geojson
++    if isinstance(ring, str):
++        try:
++            ring = json.loads(ring)
++        except json.JSONDecodeError:
++            ring = None
++    if not ring:
++        return "NULL"
++    polygon = json.dumps({"type": "Polygon", "coordinates": [ring]})
++    return "ST_SetSRID(ST_GeomFromGeoJSON('" + polygon.replace("'", "''") + "'), 4326)"
++
++
++def build_postgis_sql(detections: list[dict[str, Any]]) -> str:
++    """One CREATE TABLE + one INSERT per detection, matching the real
++    `detections` table (see module docstring)."""
++    lines = [CREATE_DETECTIONS_TABLE_SQL.rstrip(), ""]
++    for d in detections:
++        values = [
++            _sql_str(d.get("id")), _sql_str(d.get("log_id")), _sql_num(d.get("frame_index")),
++            _sql_str(d.get("frame_record_id")), _sql_str(d.get("frame_image_path")), _sql_str(d.get("class_name")),
++            _sql_num(d.get("yolo_conf")),
++            _sql_num(d.get("bbox_x1")), _sql_num(d.get("bbox_y1")), _sql_num(d.get("bbox_x2")), _sql_num(d.get("bbox_y2")),
++            _sql_num(d.get("confidence_score")), _sql_str(d.get("confidence_label")),
++            _sql_jsonb(d.get("confidence_breakdown")), _sql_num(d.get("vae_box_error")),
++            _sql_num(d.get("vae_whole_image_error")), _sql_num(d.get("vae_whole_image_percentile")),
++            _sql_num(d.get("lat")), _sql_num(d.get("lon")), _sql_str(d.get("geo_method")), _sql_num(d.get("depth_m")),
++            _sql_jsonb(d.get("footprint_geojson")), _sql_str(d.get("vae_panel_dir")), _sql_str(d.get("created_at")),
++            _geom_expr(d.get("lat"), d.get("lon")), _geom_footprint_expr(d.get("footprint_geojson")),
++        ]
++        lines.append(f"INSERT INTO detections ({', '.join(_DETECTIONS_COLUMNS)}) VALUES ({', '.join(values)});")
++    return "\n".join(lines) + "\n"
++
++
++def write_postgis_sql(path: str | Path, detections: list[dict[str, Any]]) -> str:
++    """Builds the SQL dump and writes it to `path`. Returns the text
++    (handy for a caller that wants both the file AND the string without
++    re-reading it)."""
++    sql = build_postgis_sql(detections)
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(sql, encoding="utf-8")
++    return sql
+diff --git a/backend/tests/test_csv_geolocation_engine.py b/backend/tests/test_csv_geolocation_engine.py
+index 7f10e52..fcd24f5 100644
+--- a/backend/tests/test_csv_geolocation_engine.py
++++ b/backend/tests/test_csv_geolocation_engine.py
+@@ -4,12 +4,24 @@ import tempfile
+ import unittest
+ from pathlib import Path
+ 
+-from fastapi.testclient import TestClient
+-
+-from src.backend import db_backend as db
+-from src.backend import main
+ from src.geolocation.csv_engine import geolocate_csv_detection, run_csv_pipeline_to_detections
+ 
++# main.py pulls in the full backend (torch, cv2, ...) just to import it --
++# not needed for the math-only tests below, and not always installed. See
++# the identical guard in test_footprint_geometry.py for why this is a
++# try/except instead of a plain import: a missing torch/cv2 should only
++# skip the one API-level test class at the bottom of this file, not fail
++# collection for the whole module.
++try:
++    from fastapi.testclient import TestClient
++    from src.backend import db_backend as db
++    from src.backend import main
++    _MAIN_IMPORTABLE = True
++    _MAIN_IMPORT_ERROR = None
++except ImportError as exc:
++    _MAIN_IMPORTABLE = False
++    _MAIN_IMPORT_ERROR = exc
++
+ 
+ class GeolocateCsvDetectionMathTests(unittest.TestCase):
+     """Same worked example used to explain this engine (pixel_x=1450,
+@@ -98,6 +110,7 @@ class RunCsvPipelineToDetectionsTests(unittest.TestCase):
+         self.assertEqual(len(row["bbox"]), 4)
+ 
+ 
++@unittest.skipUnless(_MAIN_IMPORTABLE, f"src.backend.main not importable ({_MAIN_IMPORT_ERROR})")
+ class GeolocateCsvEndpointTests(unittest.TestCase):
+     """API-level: POST /logs/geolocate_csv actually writes into the same
+     `detections` table the rest of the API reads from."""
+diff --git a/backend/tests/test_dimensions_and_sql_report.py b/backend/tests/test_dimensions_and_sql_report.py
+new file mode 100644
+index 0000000..f192653
+--- /dev/null
++++ b/backend/tests/test_dimensions_and_sql_report.py
+@@ -0,0 +1,108 @@
++import tempfile
++import unittest
++from pathlib import Path
++
++from fastapi.testclient import TestClient
++
++from src.backend import db_backend as db
++from src.backend import main
++from src.geolocation.postgis_export import build_postgis_sql
++
++
++class PostgisSqlExportTests(unittest.TestCase):
++    """build_postgis_sql() is a pure function -- no FastAPI/DB needed."""
++
++    def _detection(self, **overrides):
++        base = {
++            "id": "d1", "log_id": "log-1", "frame_index": 0, "frame_record_id": "f1",
++            "frame_image_path": None, "class_name": "pipe", "yolo_conf": 0.9,
++            "bbox_x1": 10.0, "bbox_y1": 20.0, "bbox_x2": 30.0, "bbox_y2": 40.0,
++            "confidence_score": 91.0, "confidence_label": "high", "confidence_breakdown": {"yolo_points": 63.0},
++            "vae_box_error": None, "vae_whole_image_error": None, "vae_whole_image_percentile": None,
++            "lat": 19.0012, "lon": 72.8015, "geo_method": "nav_fix", "depth_m": 60.0,
++            "footprint_geojson": [[72.80, 19.00], [72.81, 19.00], [72.81, 19.01], [72.80, 19.01], [72.80, 19.00]],
++            "vae_panel_dir": None, "created_at": "2026-01-01T00:00:00Z",
++        }
++        base.update(overrides)
++        return base
++
++    def test_output_has_create_table_and_one_insert_per_detection(self):
++        sql = build_postgis_sql([self._detection(), self._detection(id="d2")])
++        self.assertIn("CREATE TABLE IF NOT EXISTS detections", sql)
++        self.assertEqual(sql.count("INSERT INTO detections"), 2)
++
++    def test_string_values_are_quoted_and_escaped(self):
++        sql = build_postgis_sql([self._detection(class_name="o'brien's net")])
++        self.assertIn("'o''brien''s net'", sql)  # single quote doubled, standard SQL escaping
++
++    def test_placeholder_detection_gets_null_geom_not_a_fake_point(self):
++        sql = build_postgis_sql([self._detection(lat=0.0, lon=0.0, geo_method="placeholder")])
++        # the INSERT's geom column (second-to-last value) must be NULL, not ST_MakePoint(0, 0)
++        insert_line = [line for line in sql.splitlines() if line.startswith("INSERT")][0]
++        self.assertNotIn("ST_MakePoint(0.0, 0.0)", insert_line)
++
++    def test_footprint_produces_a_geom_footprint_polygon_expression(self):
++        sql = build_postgis_sql([self._detection()])
++        self.assertIn("ST_GeomFromGeoJSON", sql)
++        self.assertIn("geometry(Polygon", sql)
++
++    def test_missing_footprint_gets_null_geom_footprint(self):
++        sql = build_postgis_sql([self._detection(footprint_geojson=None)])
++        insert_line = [line for line in sql.splitlines() if line.startswith("INSERT")][0]
++        # geom (real, since lat/lon are set) is followed by geom_footprint, which must be
++        # NULL since there's no footprint -- i.e. the value list ends "..., <geom-expr>, NULL)".
++        self.assertTrue(insert_line.rstrip(";").endswith(", NULL)"))
++        self.assertIn("ST_MakePoint", insert_line)  # sanity: geom itself IS populated here
++
++
++class DetectionsEndpointDimensionsTests(unittest.TestCase):
++    """GET /logs/{id}/detections now includes length_m/width_m/height_m --
++    the gap that left the frontend with no way to show debris geometry at
++    all (dashboard/data.ts never had these fields to read)."""
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self._orig_db_path = main.DB_PATH
++        self._orig_output_dir = main.OUTPUT_DIR
++        main.DB_PATH = Path(self._tmp.name) / "test_dims.db"
++        main.OUTPUT_DIR = Path(self._tmp.name) / "outputs"
++        self.client = TestClient(main.app)
++        self.client.__enter__()
++
++    def tearDown(self):
++        self.client.__exit__(None, None, None)
++        main.DB_PATH = self._orig_db_path
++        main.OUTPUT_DIR = self._orig_output_dir
++        self._tmp.cleanup()
++
++    def _seed(self, log_id: str, pixels_to_meters):
++        with db.get_connection(main.DB_PATH) as conn:
++            db.create_log(conn, log_id, "fixture.png", "image", "2026-01-01T00:00:00Z",
++                           pixels_to_meters=pixels_to_meters)
++            db.insert_detection(conn, {
++                "id": "d1", "log_id": log_id, "frame_index": 0, "frame_record_id": "f1",
++                "class_name": "pipe", "yolo_conf": 0.9, "bbox": [100, 100, 180, 130],
++                "confidence_score": 91.0, "confidence_label": "high",
++                "lat": 19.0, "lon": 72.8, "geo_method": "nav_fix", "created_at": "2026-01-01T00:00:00Z",
++            })
++
++    def test_length_width_computed_from_bbox_when_pixels_to_meters_known(self):
++        self._seed("log-1", pixels_to_meters=0.15)
++        detections = self.client.get("/logs/log-1/detections").json()
++        det = detections[0]
++        self.assertAlmostEqual(det["length_m"], (180 - 100) * 0.15, places=3)
++        self.assertAlmostEqual(det["width_m"], (130 - 100) * 0.15, places=3)
++        self.assertIsNotNone(det["height_m"])
++        self.assertFalse(det["dimensions_estimated"])
++
++    def test_length_width_null_not_zero_when_pixels_to_meters_unknown(self):
++        self._seed("log-2", pixels_to_meters=None)
++        detections = self.client.get("/logs/log-2/detections").json()
++        det = detections[0]
++        self.assertIsNone(det["length_m"])
++        self.assertIsNone(det["width_m"])
++        self.assertTrue(det["dimensions_estimated"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/backend/tests/test_footprint_geometry.py b/backend/tests/test_footprint_geometry.py
+index 927113b..fbb1cf1 100644
+--- a/backend/tests/test_footprint_geometry.py
++++ b/backend/tests/test_footprint_geometry.py
+@@ -3,14 +3,25 @@ import tempfile
+ import unittest
+ from pathlib import Path
+ 
+-from fastapi.testclient import TestClient
+-
+-from src.backend import db_backend as db
+-from src.backend import main
+ from src.geolocation.georeference import geolocate_detection
+ from src.geolocation.geojson_export import build_geojson
+ from src.geolocation.nav import NavFix
+ 
++# main.py pulls in the full backend (torch, cv2, ...) just to import it --
++# not needed for the math-only tests below, and not always installed (e.g.
++# a lightweight dev machine that hasn't set up the ML deps yet). Guarded so
++# a missing torch/cv2 only skips the one API-level test class further down,
++# instead of failing collection for this entire file.
++try:
++    from fastapi.testclient import TestClient
++    from src.backend import db_backend as db
++    from src.backend import main
++    _MAIN_IMPORTABLE = True
++    _MAIN_IMPORT_ERROR = None
++except ImportError as exc:
++    _MAIN_IMPORTABLE = False
++    _MAIN_IMPORT_ERROR = exc
++
+ 
+ class FootprintGeometryTests(unittest.TestCase):
+     def setUp(self):
+@@ -79,6 +90,7 @@ class FootprintGeometryTests(unittest.TestCase):
+             self.assertFalse(fc["features"][0]["properties"]["has_footprint"])
+ 
+ 
++@unittest.skipUnless(_MAIN_IMPORTABLE, f"src.backend.main not importable ({_MAIN_IMPORT_ERROR})")
+ class MapEndpointGeometryModeTests(unittest.TestCase):
+     """GET /logs/{log_id}/map's `geometry_mode` query param (see main.py's
+     get_map_geojson) -- exercises the live API, not just build_geojson()
+diff --git a/src/dashboard/Dashboard.tsx b/src/dashboard/Dashboard.tsx
+index b5e25b2..2a346c7 100644
+--- a/src/dashboard/Dashboard.tsx
++++ b/src/dashboard/Dashboard.tsx
+@@ -128,7 +128,7 @@ function ReportsView({ logs, items }: { logs: LogSummary[]; items: DetectionReco
+     <div className="ds-report-list">{done.map(log => {
+       const urls = reportUrls(log.id)
+       return <article className="ds-report" key={log.id}><span className="ds-report-icon"><FileText size={25}/></span><div><h3>{log.filename}</h3><p>{log.n_detections} detections · {log.n_frames} frames · completed {log.completed_at ? formatTime(log.completed_at) : ''}</p><small>Generated by the backend at processing time</small></div>
+-        <div className="ds-report-links"><a className="ds-button" href={urls.csv}>CSV</a><a className="ds-button" href={urls.json}>JSON</a><a className="ds-button" href={urls.geojson}>GeoJSON</a><a className="ds-button" href={urls.pdf}>PDF</a></div>
++        <div className="ds-report-links"><a className="ds-button" href={urls.csv}>CSV</a><a className="ds-button" href={urls.json}>JSON</a><a className="ds-button" href={urls.geojson}>GeoJSON</a><a className="ds-button" href={urls.sql}>SQL</a><a className="ds-button" href={urls.pdf}>PDF</a></div>
+       </article>
+     })}</div>
+     {!done.length && <div className="ds-no-results"><strong>No completed logs yet</strong><p>Upload a sonar log to generate downloadable reports.</p></div>}</>
+@@ -173,8 +173,12 @@ function DetailDialog({ detection, onClose, onOpenPipeline }: { detection: Detec
+     <dl>{[
+       ['Priority', detection.priority], ['Confidence', `${detection.confidence}%`], ['Depth', detection.depth ? `${detection.depth.toFixed(1)} m` : 'Unavailable'],
+       ['Location', detection.located ? `${detection.latitude.toFixed(4)}° N, ${detection.longitude.toFixed(4)}° E` : 'No GPS fix'],
++      ['Length', detection.lengthM != null ? `${detection.lengthM.toFixed(2)} m` : 'Unavailable'],
++      ['Width', detection.widthM != null ? `${detection.widthM.toFixed(2)} m` : 'Unavailable'],
++      ['Height', detection.heightM != null ? `${detection.heightM.toFixed(2)} m (estimated)` : 'Unavailable'],
+       ['Timestamp', formatTime(detection.timestamp)], ['Log', detection.mission],
+     ].map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>
++    {detection.dimensionsEstimated && <p className="ds-panel-note">Length/width could not be measured for this log (no pixels-to-meters calibration was provided at processing time); height is always an estimate -- a 2D side-scan frame has no height axis.</p>}
+     <button className="ds-button primary" onClick={() => onOpenPipeline(detection.logId)}>Open in pipeline viewer</button>
+   </>}</div></dialog>
+ }
+diff --git a/src/dashboard/data.ts b/src/dashboard/data.ts
+index d93f243..a1b31cc 100644
+--- a/src/dashboard/data.ts
++++ b/src/dashboard/data.ts
+@@ -24,6 +24,10 @@ export interface DetectionRecord {
+   frameRecordId: string
+   located: boolean // false when geo_method !== 'nav_fix' (no real GPS fix for this detection)
+   rawClassName: string
++  lengthM: number | null // across-track bbox size * this log's pixels_to_meters -- null (not 0)
++  widthM: number | null  // when pixels_to_meters is unknown for this log, see dimensionsEstimated
++  heightM: number | null // always a placeholder estimate -- a 2D side-scan frame has no height axis
++  dimensionsEstimated: boolean // true when lengthM/widthM are null (pixels_to_meters unknown)
+ }
+ 
+ // Raw model class_name -> the fixed 5-category dashboard taxonomy. MUST be
+@@ -79,6 +83,10 @@ export function detectionRecordFromRaw(raw: RawDetection, missionName: string):
+     logId: raw.log_id,
+     frameRecordId: raw.frame_record_id,
+     located: raw.geo_method === 'nav_fix' && raw.lat != null && raw.lon != null,
++    lengthM: raw.length_m,
++    widthM: raw.width_m,
++    heightM: raw.height_m,
++    dimensionsEstimated: raw.dimensions_estimated,
+   }
+ }
+ 
+@@ -102,6 +110,6 @@ export function downloadCsv(filename: string, rows: (string | number)[][]) {
+   window.setTimeout(() => URL.revokeObjectURL(link.href), 1000)
+ }
+ export const detectionCsv = (items: DetectionRecord[]) => [
+-  ['ID', 'Type', 'Confidence (%)', 'Depth (m)', 'Latitude', 'Longitude', 'Timestamp', 'Priority', 'Log'],
+-  ...items.map(item => [item.id, item.type, item.confidence, item.depth, item.latitude, item.longitude, item.timestamp, item.priority, item.mission]),
++  ['ID', 'Type', 'Confidence (%)', 'Depth (m)', 'Length (m)', 'Width (m)', 'Height (m)', 'Dimensions estimated', 'Latitude', 'Longitude', 'Timestamp', 'Priority', 'Log'],
++  ...items.map(item => [item.id, item.type, item.confidence, item.depth, item.lengthM ?? '', item.widthM ?? '', item.heightM ?? '', item.dimensionsEstimated ? 'yes' : 'no', item.latitude, item.longitude, item.timestamp, item.priority, item.mission]),
+ ]
+diff --git a/src/lib/api.ts b/src/lib/api.ts
+index d39c9c7..aefe645 100644
+--- a/src/lib/api.ts
++++ b/src/lib/api.ts
+@@ -80,6 +80,10 @@ export interface RawDetection {
+   depth_m: number | null
+   vae_panel_dir: string | null
+   created_at: string
++  length_m: number | null
++  width_m: number | null
++  height_m: number | null
++  dimensions_estimated: boolean
+ }
+ 
+ export interface ModelOutputStats {
+@@ -225,6 +229,7 @@ export function reportUrls(logId: string) {
+     json: `${API_BASE}/logs/${logId}/report.json`,
+     csv: `${API_BASE}/logs/${logId}/report.csv`,
+     geojson: `${API_BASE}/logs/${logId}/report.geojson`,
++    sql: `${API_BASE}/logs/${logId}/report.sql`,
+     pdf: `${API_BASE}/logs/${logId}/report.pdf`,
+     mapPng: `${API_BASE}/logs/${logId}/map.png`,
+   }
+-- 
+2.43.0
+

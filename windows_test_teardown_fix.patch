@@ -1,0 +1,143 @@
+From c6dbeee416ec849cd7aa10fe68e90dcc35725a9c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 12 Sep 2026 19:10:13 +0000
+Subject: [PATCH] Make Windows test teardown tolerant of SQLite file-lock
+ timing
+
+tempfile.TemporaryDirectory().cleanup() was racing a just-closed sqlite3
+connection's file handle on Windows, failing with PermissionError during
+tearDown -- after the actual test assertions had already passed. Not a
+functional bug; ignore_cleanup_errors=True makes cleanup tolerate it
+instead of raising.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01E1cXxHLvxWsVApjc9w7bwH
+---
+ backend/tests/test_csv_geolocation_engine.py    |  4 ++--
+ backend/tests/test_dimensions_and_sql_report.py |  2 +-
+ backend/tests/test_footprint_geometry.py        |  2 +-
+ backend/tests/test_navigation_contract.py       |  4 ++--
+ backend/tests/test_runtime_contract.py          | 10 +++++-----
+ 5 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/backend/tests/test_csv_geolocation_engine.py b/backend/tests/test_csv_geolocation_engine.py
+index e7247b5..5b14c03 100644
+--- a/backend/tests/test_csv_geolocation_engine.py
++++ b/backend/tests/test_csv_geolocation_engine.py
+@@ -66,7 +66,7 @@ class RunCsvPipelineToDetectionsTests(unittest.TestCase):
+     shaped correctly for db.insert_detection()."""
+ 
+     def setUp(self):
+-        self._tmp = tempfile.TemporaryDirectory()
++        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+         tmp = Path(self._tmp.name)
+         self.detections_csv = tmp / "detections.csv"
+         self.nav_csv = tmp / "nav.csv"
+@@ -124,7 +124,7 @@ class GeolocateCsvEndpointTests(unittest.TestCase):
+     `detections` table the rest of the API reads from."""
+ 
+     def setUp(self):
+-        self._tmp = tempfile.TemporaryDirectory()
++        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+         self._orig_db_path = main.DB_PATH
+         self._orig_output_dir = main.OUTPUT_DIR
+         main.DB_PATH = Path(self._tmp.name) / "test_csv_geo.db"
+diff --git a/backend/tests/test_dimensions_and_sql_report.py b/backend/tests/test_dimensions_and_sql_report.py
+index 62c37d2..2b68357 100644
+--- a/backend/tests/test_dimensions_and_sql_report.py
++++ b/backend/tests/test_dimensions_and_sql_report.py
+@@ -83,7 +83,7 @@ class DetectionsEndpointDimensionsTests(unittest.TestCase):
+     all (dashboard/data.ts never had these fields to read)."""
+ 
+     def setUp(self):
+-        self._tmp = tempfile.TemporaryDirectory()
++        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+         self._orig_db_path = main.DB_PATH
+         self._orig_output_dir = main.OUTPUT_DIR
+         main.DB_PATH = Path(self._tmp.name) / "test_dims.db"
+diff --git a/backend/tests/test_footprint_geometry.py b/backend/tests/test_footprint_geometry.py
+index fbb1cf1..f4fb851 100644
+--- a/backend/tests/test_footprint_geometry.py
++++ b/backend/tests/test_footprint_geometry.py
+@@ -98,7 +98,7 @@ class MapEndpointGeometryModeTests(unittest.TestCase):
+     swallowed ValueError, etc.) would actually be caught here."""
+ 
+     def setUp(self):
+-        self._tmp = tempfile.TemporaryDirectory()
++        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+         self._orig_db_path = main.DB_PATH
+         main.DB_PATH = Path(self._tmp.name) / "test_map.db"
+ 
+diff --git a/backend/tests/test_navigation_contract.py b/backend/tests/test_navigation_contract.py
+index 031b8fd..444f562 100644
+--- a/backend/tests/test_navigation_contract.py
++++ b/backend/tests/test_navigation_contract.py
+@@ -8,7 +8,7 @@ from src.geolocation.nav import load_nav_sidecar
+ 
+ class NavigationContractTests(unittest.TestCase):
+     def test_iso_timestamp_and_one_based_single_frame_are_accepted(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             path = Path(directory) / "metadata.csv"
+             path.write_text(
+                 "frame_index,lat,lon,heading_deg,altitude_m,depth_m,timestamp\n"
+@@ -25,7 +25,7 @@ class NavigationContractTests(unittest.TestCase):
+             )
+ 
+     def test_invalid_coordinate_reports_the_csv_row(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             path = Path(directory) / "metadata.csv"
+             path.write_text(
+                 "frame_index,lat,lon,heading_deg\n0,120,-73.985,0\n",
+diff --git a/backend/tests/test_runtime_contract.py b/backend/tests/test_runtime_contract.py
+index 0485734..5042d20 100644
+--- a/backend/tests/test_runtime_contract.py
++++ b/backend/tests/test_runtime_contract.py
+@@ -16,7 +16,7 @@ class RuntimeContractTests(unittest.TestCase):
+         self.assertEqual(DETECTOR_METRICS["map50_95"], 0.53874)
+ 
+     def test_sqlite_persists_frame_and_runtime_measurements(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             path = Path(directory) / "runtime.db"
+             db.init_db(path)
+             with db.get_connection(path) as conn:
+@@ -34,14 +34,14 @@ class RuntimeContractTests(unittest.TestCase):
+                 self.assertEqual(len(db.list_frame_analyses(conn, "log-1")), 1)
+ 
+     def test_present_checkpoint_with_wrong_digest_is_rejected(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             bad = Path(directory) / "best.pt"
+             bad.write_bytes(b"not the released checkpoint")
+             with self.assertRaisesRegex(RuntimeError, "integrity verification failed"):
+                 validate_present_checkpoints({"detector": bad})
+ 
+     def test_nested_survey_zip_is_flattened_and_metadata_is_validated(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             root = Path(directory)
+             archive_path = root / "survey.zip"
+             with zipfile.ZipFile(archive_path, "w") as archive:
+@@ -56,7 +56,7 @@ class RuntimeContractTests(unittest.TestCase):
+             self.assertTrue(metadata.is_file())
+ 
+     def test_survey_zip_rejects_path_traversal(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             root = Path(directory)
+             archive_path = root / "unsafe.zip"
+             with zipfile.ZipFile(archive_path, "w") as archive:
+@@ -66,7 +66,7 @@ class RuntimeContractTests(unittest.TestCase):
+                 extract_survey_zip(archive_path, root / "out")
+ 
+     def test_nav_sidecar_is_selected_from_a_dataset_archive_with_multiple_csvs(self):
+-        with tempfile.TemporaryDirectory() as directory:
++        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+             root = Path(directory)
+             archive_path = root / "dataset.zip"
+             with zipfile.ZipFile(archive_path, "w") as archive:
+-- 
+2.43.0
+

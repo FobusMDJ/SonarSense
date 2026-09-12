@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS detections (
     lon DOUBLE PRECISION,
     geo_method TEXT,
     depth_m DOUBLE PRECISION,
+    length_m DOUBLE PRECISION,
+    width_m DOUBLE PRECISION,
     footprint_geojson JSONB,
     vae_panel_dir TEXT,
     created_at TEXT NOT NULL,
@@ -112,6 +114,8 @@ ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_inference_ms DOUBLE PRECISION
 ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_frames INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE detections ADD COLUMN IF NOT EXISTS footprint_geojson JSONB;
 ALTER TABLE detections ADD COLUMN IF NOT EXISTS geom_footprint geometry(Polygon, 4326);
+ALTER TABLE detections ADD COLUMN IF NOT EXISTS length_m DOUBLE PRECISION;
+ALTER TABLE detections ADD COLUMN IF NOT EXISTS width_m DOUBLE PRECISION;
 """
 
 # Everything in SCHEMA after the `CREATE EXTENSION` line -- used as a
@@ -295,16 +299,17 @@ def insert_detection(conn, det: dict[str, Any]) -> None:
                 id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
                 bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
                 confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
-                lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at, geom, geom_footprint
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                      {geom_sql}, {footprint_geom_sql})""",
+                lat, lon, geo_method, depth_m, length_m, width_m, footprint_geojson, vae_panel_dir,
+                created_at, geom, geom_footprint
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                      %s, %s, %s, {geom_sql}, {footprint_geom_sql})""",
             (
                 det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
                 det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
                 *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
                 det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
-                lat, lon, det.get("geo_method"), det.get("depth_m"), footprint_col,
-                det.get("vae_panel_dir"), det["created_at"], *geom_params, *footprint_geom_params,
+                lat, lon, det.get("geo_method"), det.get("depth_m"), det.get("length_m"), det.get("width_m"),
+                footprint_col, det.get("vae_panel_dir"), det["created_at"], *geom_params, *footprint_geom_params,
             ),
         )
 

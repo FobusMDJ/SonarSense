@@ -125,3 +125,39 @@ def bbox_dimensions_m(bbox_x1: float, bbox_y1: float, bbox_x2: float, bbox_y2: f
         width = round(abs(bbox_y2 - bbox_y1) * pixels_to_meters, 3)
     height = ESTIMATED_HEIGHT_M.get(display_class, 1.0)
     return {"length": length, "width": width, "height": height}
+
+
+def resolved_dimensions_m(detection: dict, pixels_to_meters: Optional[float]) -> dict:
+    """The single place every caller (GET /logs/{id}/detections, the JSON/CSV/
+    SQL report writers) should go for a detection's length/width/height --
+    NOT bbox_dimensions_m directly, which is a fallback this function calls
+    for you when needed.
+
+    PREFERS a detection's own stored length_m/width_m columns, when present,
+    over the generic bbox * pixels_to_meters guess below. Those columns are
+    only populated at insert time by an ingestion path that computed real-
+    world size itself from actual sonar geometry -- see
+    src/geolocation/csv_engine.py's geolocate_csv_detection, which derives
+    width from the across-track bbox extent and length from the along-track
+    extent using the same slant-range math it uses for lat/lon, not a bare
+    pixel-count heuristic. The image/YOLO pipeline has no equivalent physics
+    -based sizing step yet, so its detections have NULL length_m/width_m at
+    insert time and fall through to bbox_dimensions_m here, unchanged from
+    before this function existed.
+
+    Always returns a dict shaped like bbox_dimensions_m's ({length, width,
+    height}); height has no measured equivalent in either ingestion path and
+    is always the ESTIMATED_HEIGHT_M placeholder."""
+    display_class = display_classification(detection["class_name"])
+    stored_length = detection.get("length_m")
+    stored_width = detection.get("width_m")
+    if stored_length is not None and stored_width is not None:
+        return {
+            "length": stored_length,
+            "width": stored_width,
+            "height": ESTIMATED_HEIGHT_M.get(display_class, 1.0),
+        }
+    return bbox_dimensions_m(
+        detection["bbox_x1"], detection["bbox_y1"], detection["bbox_x2"], detection["bbox_y2"],
+        pixels_to_meters, display_class,
+    )

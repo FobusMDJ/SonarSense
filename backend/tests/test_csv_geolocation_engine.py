@@ -4,11 +4,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
-from src.backend import db_backend as db
-from src.backend import main
 from src.geolocation.csv_engine import geolocate_csv_detection, run_csv_pipeline_to_detections
+
+# main.py pulls in the full backend (torch, cv2, ...) just to import it --
+# not needed for the math-only tests below, and not always installed. See
+# the identical guard in test_footprint_geometry.py for why this is a
+# try/except instead of a plain import: a missing torch/cv2 should only
+# skip the one API-level test class at the bottom of this file, not fail
+# collection for the whole module.
+try:
+    from fastapi.testclient import TestClient
+    from src.backend import db_backend as db
+    from src.backend import main
+    _MAIN_IMPORTABLE = True
+    _MAIN_IMPORT_ERROR = None
+except ImportError as exc:
+    _MAIN_IMPORTABLE = False
+    _MAIN_IMPORT_ERROR = exc
 
 
 class GeolocateCsvDetectionMathTests(unittest.TestCase):
@@ -54,7 +66,7 @@ class RunCsvPipelineToDetectionsTests(unittest.TestCase):
     shaped correctly for db.insert_detection()."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         tmp = Path(self._tmp.name)
         self.detections_csv = tmp / "detections.csv"
         self.nav_csv = tmp / "nav.csv"
@@ -89,21 +101,30 @@ class RunCsvPipelineToDetectionsTests(unittest.TestCase):
         row = rows[0]
         for key in ("id", "log_id", "frame_index", "frame_record_id", "class_name", "yolo_conf", "bbox",
                     "confidence_score", "confidence_label", "lat", "lon", "geo_method", "depth_m",
-                    "footprint_geojson", "created_at"):
+                    "length_m", "width_m", "footprint_geojson", "created_at"):
             self.assertIn(key, row)
         self.assertEqual(row["log_id"], "log-1")
         self.assertEqual(row["geo_method"], "nav_fix")
         self.assertIsNone(row["footprint_geojson"])
         self.assertAlmostEqual(row["depth_m"], 60.0, places=2)
         self.assertEqual(len(row["bbox"]), 4)
+        # This engine's own geometry stats (see GeolocateCsvDetectionMathTests'
+        # worked example: bbox_w=80px, bbox_h=30px, range_per_pixel=0.05 ->
+        # width_m=4.0, length_m=1.5) must survive into the row unchanged -- this
+        # is what makes it into the `detections` table's length_m/width_m
+        # columns, so downstream readers use the engine's real math instead of
+        # re-deriving a size from the reconstructed bbox.
+        self.assertAlmostEqual(row["width_m"], 4.0, places=2)
+        self.assertAlmostEqual(row["length_m"], 1.5, places=2)
 
 
+@unittest.skipUnless(_MAIN_IMPORTABLE, f"src.backend.main not importable ({_MAIN_IMPORT_ERROR})")
 class GeolocateCsvEndpointTests(unittest.TestCase):
     """API-level: POST /logs/geolocate_csv actually writes into the same
     `detections` table the rest of the API reads from."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._orig_db_path = main.DB_PATH
         self._orig_output_dir = main.OUTPUT_DIR
         main.DB_PATH = Path(self._tmp.name) / "test_csv_geo.db"
@@ -144,6 +165,13 @@ class GeolocateCsvEndpointTests(unittest.TestCase):
         detections = self.client.get(f"/logs/{log_id}/detections").json()
         self.assertEqual(len(detections), 1)
         self.assertAlmostEqual(detections[0]["depth_m"], 60.0, places=2)
+        # The whole point of storing length_m/width_m on the row at insert time:
+        # GET /logs/{id}/detections must return THIS engine's own real-world
+        # size (see the worked example above), not a bbox-diff guess computed
+        # from the reconstructed bbox against some unrelated pixels_to_meters.
+        self.assertAlmostEqual(detections[0]["width_m"], 4.0, places=2)
+        self.assertAlmostEqual(detections[0]["length_m"], 1.5, places=2)
+        self.assertFalse(detections[0]["dimensions_estimated"])
 
         map_fc = self.client.get(f"/logs/{log_id}/map").json()
         self.assertEqual(len(map_fc["features"]), 1)

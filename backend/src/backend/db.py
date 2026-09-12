@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS detections (
     geo_method TEXT,                   -- 'nav_fix' | 'placeholder'
     depth_m REAL,                      -- water depth below surface, NULL unless the nav
                                         -- sidecar/XTF actually carried one (never fabricated)
+    length_m REAL, width_m REAL,       -- real-world debris size computed DIRECTLY by a
+                                        -- geolocation engine's own physics (see
+                                        -- src/geolocation/csv_engine.py's geolocate_csv_
+                                        -- detection); NULL for the image/YOLO pipeline, which
+                                        -- has no equivalent sizing step -- see class_taxonomy.
+                                        -- resolved_dimensions_m for the bbox-based fallback
+                                        -- every reader uses when these are NULL.
     footprint_geojson TEXT,            -- JSON list of [lon, lat] pairs, the debris's 4-corner
                                         -- real-world footprint polygon; NULL for placeholder
                                         -- detections (see georeference.py's GeoResult.footprint)
@@ -90,6 +97,8 @@ CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
 _DETECTIONS_MIGRATIONS = [
     ("depth_m", "REAL"),
     ("footprint_geojson", "TEXT"),
+    ("length_m", "REAL"),
+    ("width_m", "REAL"),
 ]
 
 _LOG_MIGRATIONS = [
@@ -211,14 +220,15 @@ def insert_detection(conn: sqlite3.Connection, det: dict[str, Any]) -> None:
             id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
             bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
             confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
-            lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            lat, lon, geo_method, depth_m, length_m, width_m, footprint_geojson, vae_panel_dir, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
             det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
             *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
             det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
             det.get("lat"), det.get("lon"), det.get("geo_method"), det.get("depth_m"),
+            det.get("length_m"), det.get("width_m"),
             det.get("footprint_geojson"), det.get("vae_panel_dir"), det["created_at"],
         ),
     )

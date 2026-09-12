@@ -24,6 +24,10 @@ export interface DetectionRecord {
   frameRecordId: string
   located: boolean // false when geo_method !== 'nav_fix' (no real GPS fix for this detection)
   rawClassName: string
+  lengthM: number | null // across-track bbox size * this log's pixels_to_meters -- null (not 0)
+  widthM: number | null  // when pixels_to_meters is unknown for this log, see dimensionsEstimated
+  heightM: number | null // always a placeholder estimate -- a 2D side-scan frame has no height axis
+  dimensionsEstimated: boolean // true when lengthM/widthM are null (pixels_to_meters unknown)
 }
 
 // Raw model class_name -> the fixed 5-category dashboard taxonomy. MUST be
@@ -79,6 +83,10 @@ export function detectionRecordFromRaw(raw: RawDetection, missionName: string): 
     logId: raw.log_id,
     frameRecordId: raw.frame_record_id,
     located: raw.geo_method === 'nav_fix' && raw.lat != null && raw.lon != null,
+    lengthM: raw.length_m,
+    widthM: raw.width_m,
+    heightM: raw.height_m,
+    dimensionsEstimated: raw.dimensions_estimated,
   }
 }
 
@@ -102,6 +110,6 @@ export function downloadCsv(filename: string, rows: (string | number)[][]) {
   window.setTimeout(() => URL.revokeObjectURL(link.href), 1000)
 }
 export const detectionCsv = (items: DetectionRecord[]) => [
-  ['ID', 'Type', 'Confidence (%)', 'Depth (m)', 'Latitude', 'Longitude', 'Timestamp', 'Priority', 'Log'],
-  ...items.map(item => [item.id, item.type, item.confidence, item.depth, item.latitude, item.longitude, item.timestamp, item.priority, item.mission]),
+  ['ID', 'Type', 'Confidence (%)', 'Depth (m)', 'Length (m)', 'Width (m)', 'Height (m)', 'Dimensions estimated', 'Latitude', 'Longitude', 'Timestamp', 'Priority', 'Log'],
+  ...items.map(item => [item.id, item.type, item.confidence, item.depth, item.lengthM ?? '', item.widthM ?? '', item.heightM ?? '', item.dimensionsEstimated ? 'yes' : 'no', item.latitude, item.longitude, item.timestamp, item.priority, item.mission]),
 ]

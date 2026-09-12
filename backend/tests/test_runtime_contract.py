@@ -16,7 +16,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(DETECTOR_METRICS["map50_95"], 0.53874)
 
     def test_sqlite_persists_frame_and_runtime_measurements(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             path = Path(directory) / "runtime.db"
             db.init_db(path)
             with db.get_connection(path) as conn:
@@ -34,14 +34,14 @@ class RuntimeContractTests(unittest.TestCase):
                 self.assertEqual(len(db.list_frame_analyses(conn, "log-1")), 1)
 
     def test_present_checkpoint_with_wrong_digest_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             bad = Path(directory) / "best.pt"
             bad.write_bytes(b"not the released checkpoint")
             with self.assertRaisesRegex(RuntimeError, "integrity verification failed"):
                 validate_present_checkpoints({"detector": bad})
 
     def test_nested_survey_zip_is_flattened_and_metadata_is_validated(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             archive_path = root / "survey.zip"
             with zipfile.ZipFile(archive_path, "w") as archive:
@@ -56,7 +56,7 @@ class RuntimeContractTests(unittest.TestCase):
             self.assertTrue(metadata.is_file())
 
     def test_survey_zip_rejects_path_traversal(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             archive_path = root / "unsafe.zip"
             with zipfile.ZipFile(archive_path, "w") as archive:
@@ -66,7 +66,7 @@ class RuntimeContractTests(unittest.TestCase):
                 extract_survey_zip(archive_path, root / "out")
 
     def test_nav_sidecar_is_selected_from_a_dataset_archive_with_multiple_csvs(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             archive_path = root / "dataset.zip"
             with zipfile.ZipFile(archive_path, "w") as archive:

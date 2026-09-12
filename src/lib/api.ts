@@ -80,6 +80,10 @@ export interface RawDetection {
   depth_m: number | null
   vae_panel_dir: string | null
   created_at: string
+  length_m: number | null
+  width_m: number | null
+  height_m: number | null
+  dimensions_estimated: boolean
 }
 
 export interface ModelOutputStats {
@@ -225,6 +229,7 @@ export function reportUrls(logId: string) {
     json: `${API_BASE}/logs/${logId}/report.json`,
     csv: `${API_BASE}/logs/${logId}/report.csv`,
     geojson: `${API_BASE}/logs/${logId}/report.geojson`,
+    sql: `${API_BASE}/logs/${logId}/report.sql`,
     pdf: `${API_BASE}/logs/${logId}/report.pdf`,
     mapPng: `${API_BASE}/logs/${logId}/map.png`,
   }
