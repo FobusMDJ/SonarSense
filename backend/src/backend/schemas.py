@@ -73,9 +73,13 @@ class ModelOutputStats(BaseModel):
     log_id: str
     n_detections: int
     counts_by_class: dict[str, int]
+    raw_counts_by_class: dict[str, int]
     mean_confidence_by_class: dict[str, float]
     n_low_confidence: int
     low_confidence_threshold: float
+    confidence_threshold: Optional[float] = None
+    mean_inference_ms: Optional[float] = None
+    fps: Optional[float] = None
 
 
 class VaeStats(BaseModel):

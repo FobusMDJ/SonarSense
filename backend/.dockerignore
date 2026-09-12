@@ -1,0 +1,15 @@
+.git
+.env
+.venv
+__pycache__
+*.py[cod]
+*.pt
+*.pth
+models
+backend_uploads
+backend_outputs
+runtime
+sonarsense*.db
+data
+runs
+outputs

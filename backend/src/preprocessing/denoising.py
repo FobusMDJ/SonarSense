@@ -125,7 +125,7 @@ class Blind2UnblindDenoiser:
         resolved = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._device = torch.device(resolved)
 
-        checkpoint = torch.load(weights_path, map_location=self._device)
+        checkpoint = torch.load(weights_path, map_location=self._device, weights_only=True)
         model = DenoiserUNet(in_channels=1, out_channels=1, base_width=checkpoint.get("base_width", 48))
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
@@ -270,6 +270,8 @@ def denoise(
     docstring for the measured speed/quality tradeoff. Ignored by `dspnet`
     and `lee`.
     """
+    if method == "none":
+        return image
     if method == "lee":
         return lee_filter(image, window_size=window_size)
 
@@ -287,4 +289,4 @@ def denoise(
             logger.warning("%s -- falling back to Lee filter for this call.", exc)
             return lee_filter(image, window_size=window_size)
 
-    raise ValueError(f"Unknown denoising method '{method}'. Choose from: lee, blind2unblind, dspnet.")
+    raise ValueError(f"Unknown denoising method '{method}'. Choose from: none, lee, blind2unblind, dspnet.")

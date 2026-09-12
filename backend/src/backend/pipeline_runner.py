@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,7 @@ import numpy as np
 import torch
 
 from src.backend import db_backend as db
+from src.backend.model_release import INFERENCE_LOCK, JOB_LOCK, get_vae_model, get_yolo_model
 from src.confidence.scoring import score_detection
 from src.geolocation.geojson_export import write_geojson
 from src.geolocation.georeference import geolocate_detection
@@ -65,7 +67,6 @@ from src.geolocation.nav import NavFix
 from src.preprocessing.ingestion import SSSRecord, ingest_source
 from src.preprocessing.pipeline import PreprocessingPipeline
 from src.utils.config import get_logger, load_config
-from src.vae.test_vae import load_model as load_vae_model
 from src.vae.vae_analysis import crop_box, run_vae, save_all_modules
 
 logger = get_logger(__name__)
@@ -131,7 +132,7 @@ def _build_preprocessing_config(denoise_method: str, denoise_weights_path: Optio
     return cfg
 
 
-def process_log(
+def _process_log_unlocked(
     log_id: str,
     source_path: Path,
     yolo_weights: Path,
@@ -148,8 +149,6 @@ def process_log(
     contrast_method: str = "none",
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
-    from ultralytics import YOLO
-
     out_dir = output_dir / log_id
     out_dir.mkdir(parents=True, exist_ok=True)
     torch_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -167,8 +166,9 @@ def process_log(
 
         preproc_cfg = _build_preprocessing_config(denoise_method, denoise_weights_path, contrast_method)
         pipeline = PreprocessingPipeline(config=preproc_cfg)
-        yolo = YOLO(str(yolo_weights))
-        vae_model = load_vae_model(str(vae_weights), torch_device)
+        yolo = get_yolo_model(str(yolo_weights))
+        vae_model = get_vae_model(str(vae_weights), str(torch_device))
+        detector_inference_ms = 0.0
 
         frame_records = []  # per-frame working state, built up across passes
         for i, record in enumerate(records):
@@ -179,7 +179,10 @@ def process_log(
 
             _emit(progress_cb, log_id=log_id, stage="detect", frame_index=i, n_frames_total=n_frames,
                   message=f"Running YOLO on frame {i + 1}/{n_frames}")
-            results = yolo.predict(source=final, conf=yolo_conf, verbose=False)
+            started = time.perf_counter()
+            with INFERENCE_LOCK:
+                results = yolo.predict(source=final, conf=yolo_conf, verbose=False)
+            detector_inference_ms += (time.perf_counter() - started) * 1000.0
             r = results[0]
             names = r.names
             boxes = [
@@ -190,14 +193,19 @@ def process_log(
 
             _emit(progress_cb, log_id=log_id, stage="vae", frame_index=i, n_frames_total=n_frames,
                   message=f"Running VAE analysis on frame {i + 1}/{n_frames}")
-            vae_result = run_vae(vae_model, final, torch_device)
+            with INFERENCE_LOCK:
+                vae_result = run_vae(vae_model, final, torch_device)
             frame_out_dir = out_dir / "vae" / record.record_id
             save_all_modules(vae_result, frame_out_dir)
 
             box_vae_errors = []
             for box in boxes:
                 crop = crop_box(final, [int(v) for v in box["xyxy"]])
-                box_vae_errors.append(run_vae(vae_model, crop, torch_device)["scalar_error"] if crop.size else None)
+                if crop.size:
+                    with INFERENCE_LOCK:
+                        box_vae_errors.append(run_vae(vae_model, crop, torch_device)["scalar_error"])
+                else:
+                    box_vae_errors.append(None)
 
             frame_records.append({
                 "record": record,
@@ -228,6 +236,14 @@ def process_log(
                 record = fr["record"]
                 final = fr["final"]
                 percentile = float(percentiles[frame_idx])
+                db.insert_frame_analysis(conn, {
+                    "log_id": log_id,
+                    "frame_index": frame_idx,
+                    "frame_record_id": record.record_id,
+                    "whole_image_error": fr["whole_image_error"],
+                    "percentile": percentile,
+                    "vae_panel_dir": fr["vae_panel_dir"],
+                })
                 for box_idx, box in enumerate(fr["boxes"]):
                     conf_result = score_detection(
                         yolo_conf=box["conf"], class_name=box["class_name"], xyxy=box["xyxy"],
@@ -263,6 +279,7 @@ def process_log(
                     db.insert_detection(conn, det)
                     n_detections += 1
             db.update_log_counts(conn, log_id, n_frames, n_detections)
+            db.update_log_performance(conn, log_id, detector_inference_ms, n_frames)
             db.update_log_status(conn, log_id, "done", completed_at=_now_iso())
 
         _write_reports(db_path, log_id, out_dir)
@@ -275,6 +292,13 @@ def process_log(
             db.update_log_status(conn, log_id, "error", error_message=str(exc), completed_at=_now_iso())
         _emit(progress_cb, log_id=log_id, stage="error", message=str(exc))
         raise
+
+
+def process_log(*args, **kwargs) -> None:
+    """Serialize complete local jobs so cached models cannot be loaded or
+    used concurrently by competing upload threads."""
+    with JOB_LOCK:
+        _process_log_unlocked(*args, **kwargs)
 
 
 def _write_reports(db_path: Path, log_id: str, out_dir: Path) -> None:

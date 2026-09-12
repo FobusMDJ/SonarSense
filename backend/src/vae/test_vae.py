@@ -60,7 +60,7 @@ logger = get_logger(__name__)
 
 
 def load_model(weights_path: str, device: torch.device) -> ConvVAE:
-    ckpt = torch.load(weights_path, map_location=device)
+    ckpt = torch.load(weights_path, map_location=device, weights_only=True)
     model = ConvVAE(
         input_size=ckpt["input_size"],
         latent_dim=ckpt["latent_dim"],

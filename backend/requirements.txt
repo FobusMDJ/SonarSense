@@ -8,10 +8,10 @@ matplotlib>=3.8
 tqdm>=4.66
 
 # --- Denoiser training (Blind2Unblind) / VAE ---
-torch>=2.2
+torch==2.5.1
 
 # --- YOLO11 detection stage (in use now) ---
-ultralytics>=8.2
+ultralytics==8.4.147
 
 # --- Later pipeline stages (classification) ---
 # Uncomment as those modules are built.

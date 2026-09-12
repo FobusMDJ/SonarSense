@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SONARSENSE_PORT:-8000}:8000"
+    environment:
+      DB_BACKEND: sqlite
+      SQLITE_DB_PATH: /data/sonarsense.db
+    volumes:
+      - ./best.pt:/app/best.pt:ro
+      - ./src/vae/vae_epoch100.pth:/app/src/vae/vae_epoch100.pth:ro
+      - ./models/B2Ueph2.pth:/app/models/B2Ueph2.pth:ro
+      - ./runtime:/data
+      - ./runtime/uploads:/app/backend_uploads
+      - ./runtime/outputs:/app/backend_outputs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

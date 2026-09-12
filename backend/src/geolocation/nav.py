@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,22 @@ class NavFix:
     timestamp: Optional[float] = None
 
 
+def _parse_timestamp(value: str | None) -> Optional[float]:
+    """Accept Unix seconds or an ISO-8601 timestamp from exported metadata."""
+    if not value or not value.strip():
+        return None
+    value = value.strip()
+    try:
+        return float(value)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid timestamp '{value}'. Use Unix seconds or ISO-8601, for example 2026-06-14T09:00:00Z."
+            ) from exc
+
+
 def load_nav_sidecar(path: str | Path) -> list[NavFix]:
     """Load a nav sidecar CSV with columns:
     frame_index,lat,lon,heading_deg[,altitude_m,depth_m,timestamp]
@@ -40,7 +57,7 @@ def load_nav_sidecar(path: str | Path) -> list[NavFix]:
     """
     path = Path(path)
     fixes = []
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         required = {"frame_index", "lat", "lon", "heading_deg"}
         if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
@@ -48,16 +65,26 @@ def load_nav_sidecar(path: str | Path) -> list[NavFix]:
                 f"Nav sidecar {path} must have columns {sorted(required)} "
                 f"(+ optional altitude_m, depth_m, timestamp). Found: {reader.fieldnames}"
             )
-        for row in reader:
-            fixes.append(NavFix(
-                frame_index=int(row["frame_index"]),
-                lat=float(row["lat"]),
-                lon=float(row["lon"]),
-                heading_deg=float(row["heading_deg"]),
-                altitude_m=float(row["altitude_m"]) if row.get("altitude_m") else None,
-                depth_m=float(row["depth_m"]) if row.get("depth_m") else None,
-                timestamp=float(row["timestamp"]) if row.get("timestamp") else None,
-            ))
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                lat = float(row["lat"])
+                lon = float(row["lon"])
+                heading = float(row["heading_deg"])
+                if not -90 <= lat <= 90:
+                    raise ValueError(f"latitude {lat} is outside -90..90")
+                if not -180 <= lon <= 180:
+                    raise ValueError(f"longitude {lon} is outside -180..180")
+                fixes.append(NavFix(
+                    frame_index=int(row["frame_index"]),
+                    lat=lat,
+                    lon=lon,
+                    heading_deg=heading % 360.0,
+                    altitude_m=float(row["altitude_m"]) if row.get("altitude_m") else None,
+                    depth_m=float(row["depth_m"]) if row.get("depth_m") else None,
+                    timestamp=_parse_timestamp(row.get("timestamp")),
+                ))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid navigation data in {path} at CSV row {line_number}: {exc}") from exc
     fixes.sort(key=lambda f: f.frame_index)
     return fixes
 

@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
-import { CheckCircle2, CloudUpload, FileWarning, Loader2, UploadCloud } from 'lucide-react'
-import { ApiError, uploadLog, watchProgress, type ProgressEvent } from '../lib/api'
+import { CheckCircle2, CloudUpload, FileArchive, FileCheck2, FileWarning, Loader2, UploadCloud } from 'lucide-react'
+import { ApiError, uploadLog, uploadSurveyZip, watchProgress, type ProgressEvent } from '../lib/api'
 
 const STAGE_LABELS: Record<string, string> = {
   ingest: 'Ingesting sonar log',
@@ -24,8 +24,11 @@ type Phase = 'idle' | 'uploading' | 'processing' | 'done' | 'error'
 export function UploadView({ onProcessed }: UploadViewProps) {
   const fileInput = useRef<HTMLInputElement>(null)
   const navInput = useRef<HTMLInputElement>(null)
+  const zipInput = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
   const [navFile, setNavFile] = useState<File | null>(null)
+  const [zipFile, setZipFile] = useState<File | null>(null)
+  const [archiveError, setArchiveError] = useState('')
   const [denoiseMethod, setDenoiseMethod] = useState<'none' | 'lee' | 'blind2unblind'>('none')
   const [contrastMethod, setContrastMethod] = useState<'none' | 'clahe' | 'histeq'>('none')
   const [yoloConf, setYoloConf] = useState(0.25)
@@ -38,33 +41,38 @@ export function UploadView({ onProcessed }: UploadViewProps) {
   const latest = events[events.length - 1]
 
   async function submit() {
-    if (!file) return
+    if (!file && !zipFile) return
     setPhase('uploading')
     setEvents([])
     setErrorMessage('')
     try {
-      const response = await uploadLog(file, {
-        navSidecar: navFile,
-        denoiseMethod,
-        contrastMethod,
-        yoloConf,
-        pixelsToMeters,
-      })
+      const options = { denoiseMethod, contrastMethod, yoloConf, pixelsToMeters }
+      const response = zipFile
+        ? await uploadSurveyZip(zipFile, options)
+        : await uploadLog(file!, { ...options, navSidecar: navFile })
       setPhase('processing')
+      let sawTerminalEvent = false
       watchProgress(
         response.log_id,
         (event) => {
           setEvents(prev => [...prev, event])
           if (event.stage === 'done') {
+            sawTerminalEvent = true
             setPhase('done')
             setDoneLogId(response.log_id)
           }
           if (event.stage === 'error') {
+            sawTerminalEvent = true
             setPhase('error')
             setErrorMessage(event.message)
           }
         },
-        () => { /* socket closed -- terminal stage already handled above */ },
+        () => {
+          if (!sawTerminalEvent) {
+            setPhase('error')
+            setErrorMessage('The processing connection closed. You can start over or check Records for the server-side result.')
+          }
+        },
       )
     } catch (err) {
       setPhase('error')
@@ -73,7 +81,23 @@ export function UploadView({ onProcessed }: UploadViewProps) {
   }
 
   function reset() {
-    setFile(null); setNavFile(null); setPhase('idle'); setEvents([]); setErrorMessage(''); setDoneLogId(null)
+    setFile(null); setNavFile(null); setZipFile(null); setArchiveError(''); setPhase('idle'); setEvents([]); setErrorMessage(''); setDoneLogId(null)
+    if (fileInput.current) fileInput.current.value = ''
+    if (navInput.current) navInput.current.value = ''
+    if (zipInput.current) zipInput.current.value = ''
+  }
+
+  function selectZip(selected: File | null) {
+    setPhase('idle'); setEvents([]); setErrorMessage(''); setDoneLogId(null)
+    setArchiveError('')
+    if (!selected) { setZipFile(null); return }
+    if (!selected.name.toLowerCase().endsWith('.zip')) {
+      setZipFile(null); setArchiveError('Choose a file ending in .zip.'); return
+    }
+    if (selected.size > 256 * 1024 * 1024) {
+      setZipFile(null); setArchiveError('ZIP files must be 256 MB or smaller.'); return
+    }
+    setZipFile(selected); setFile(null); setNavFile(null)
     if (fileInput.current) fileInput.current.value = ''
     if (navInput.current) navInput.current.value = ''
   }
@@ -85,16 +109,39 @@ export function UploadView({ onProcessed }: UploadViewProps) {
       <div className="ds-page-intro">
         <div>
           <h2>Ingest a sonar log</h2>
-          <p>Upload a side-scan sonar log (.xtf) or a single image to run it through the full SonarSense pipeline: preprocessing, YOLO26 detection, VAE anomaly analysis, confidence scoring, and geolocation.</p>
+          <p>Upload a complete survey ZIP, side-scan sonar log, or image to run the full SonarSense processing and geolocation pipeline.</p>
         </div>
       </div>
 
       <section className="ds-panel ds-upload-panel">
         <header className="ds-panel-title"><h2>Upload</h2></header>
         <div className="ds-upload-grid">
+          <div className="ds-archive-section">
+            <div className="ds-archive-copy">
+              <span className="ds-upload-kicker">Complete survey</span>
+              <h3>Upload images and metadata together</h3>
+              <p>The ZIP can contain nested frame folders. Include one CSV with <code>frame_index</code>, <code>lat</code>, <code>lon</code>, and <code>heading_deg</code>.</p>
+              <ul aria-label="ZIP requirements">
+                <li><FileCheck2 size={14} /> Sonar images: PNG, JPG, TIFF, BMP, PGM, PBM, PPM, PNM, or NPY</li>
+                <li><FileCheck2 size={14} /> Metadata: metadata.csv, navigation.csv, nav.csv, or the only CSV</li>
+                <li><FileCheck2 size={14} /> Maximum archive size: 256 MB</li>
+              </ul>
+            </div>
+            <label className={`ds-dropzone ds-dropzone-zip ${zipFile ? 'has-file' : ''}`}>
+              <input ref={zipInput} type="file" accept=".zip,application/zip" disabled={busy}
+                     onChange={event => selectZip(event.target.files?.[0] ?? null)} />
+              <FileArchive size={28} />
+              <strong>{zipFile ? zipFile.name : 'Choose a complete survey ZIP'}</strong>
+              <small>{zipFile ? `${(zipFile.size / 1_048_576).toFixed(2)} MB · ready to validate` : 'Frames + metadata CSV in one archive'}</small>
+            </label>
+            <p className="ds-inline-validation" role={archiveError ? 'alert' : undefined}>{archiveError || 'The archive structure and CSV headers are checked before processing begins.'}</p>
+          </div>
+
+          <div className="ds-upload-divider"><span>Or upload individual files</span></div>
+
           <label className={`ds-dropzone ${file ? 'has-file' : ''}`}>
             <input ref={fileInput} type="file" accept=".xtf,image/*" disabled={busy}
-                   onChange={event => setFile(event.target.files?.[0] ?? null)} />
+                   onChange={event => { setPhase('idle'); setEvents([]); setErrorMessage(''); setDoneLogId(null); setFile(event.target.files?.[0] ?? null); setZipFile(null); setArchiveError(''); if (zipInput.current) zipInput.current.value = '' }} />
             <UploadCloud size={26} />
             <strong>{file ? file.name : 'Choose a sonar log or image'}</strong>
             <small>{file ? `${(file.size / 1_048_576).toFixed(2)} MB` : '.xtf, .png, .jpg, .tif'}</small>
@@ -134,9 +181,9 @@ export function UploadView({ onProcessed }: UploadViewProps) {
           </div>
 
           <div className="ds-upload-actions">
-            <button className="ds-button primary" disabled={!file || busy} onClick={submit}>
+            <button className="ds-button primary" disabled={(!file && !zipFile) || busy || Boolean(archiveError)} onClick={submit}>
               {busy ? <Loader2 size={16} className="ds-spin" /> : <CloudUpload size={16} />}
-              {busy ? 'Processing…' : 'Upload & process'}
+              {busy ? 'Processing…' : zipFile ? 'Upload ZIP & process' : 'Upload & process'}
             </button>
             {phase !== 'idle' && <button className="ds-button" onClick={reset} disabled={busy}>Start over</button>}
           </div>

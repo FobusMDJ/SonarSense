@@ -108,7 +108,8 @@ def ingest_source(
       - a .xtf file  -> src.geolocation.xtf_reader.ingest_xtf
       - a directory  -> ingest_directory_with_nav if nav_sidecar_path is
                          given, else plain ingest_directory
-      - a single image file -> yields one record from ingest_file
+      - a single image file -> yields one record and attaches the nearest
+                               sidecar fix when nav_sidecar_path is given
 
     This is the function the backend's upload/pipeline orchestrator should
     call rather than picking a specific ingest_* function itself, so adding
@@ -126,4 +127,11 @@ def ingest_source(
         else:
             yield from ingest_directory(path)
         return
-    yield ingest_file(path)
+    record = ingest_file(path)
+    if nav_sidecar_path:
+        from src.geolocation.nav import load_nav_sidecar, nearest_fix
+
+        fixes = load_nav_sidecar(nav_sidecar_path)
+        record.metadata["nav_fix"] = nearest_fix(fixes, 0)
+        record.metadata["source_format"] = "image+sidecar"
+    yield record

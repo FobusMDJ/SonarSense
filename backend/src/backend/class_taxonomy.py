@@ -4,11 +4,8 @@ React frontend (FobusMDJ/SonarSense) both use -- Shipwreck ("Wreck"), Pipe,
 Ghost Net ("Net"), Cylinder ("Rock"), Other Debris ("Other") -- independent
 of which specific detection checkpoint produced the label.
 
-WHY THIS EXISTS: the currently-deployed best.pt was trained with 5 classes
-(shipwreck, human, cylinder, ghost_net, pipe). A newer model (trained
-separately by a teammate, not yet wired in -- config/backend.yaml's
-yolo_weights_path just needs to point at it when it's ready) uses a
-different class set entirely (reported as pipe/shipwreck/aircraft). Rather
+WHY THIS EXISTS: the released weights-v1 best.pt checkpoint has exactly four
+raw classes (aircraft, human, ship, pipe). Rather
 than hard-coding the API's classification field to one checkpoint's exact
 label set, every raw class_name -- from either model, or any future one --
 gets funneled through CLASS_DISPLAY_MAP into the same fixed 5-category
@@ -16,7 +13,10 @@ taxonomy the dashboard renders (donut chart, map legend, filters), while the
 RAW label is preserved alongside it in every API response for anyone who
 wants the specific one. A class this map hasn't seen before (e.g.
 'aircraft') lands in 'Other Debris' rather than erroring -- exactly what the
-reference deck's own 'Other' bucket (icon: '?') is for.
+reference deck's own 'Other' bucket (icon: '?') is for. Specifically,
+ship maps to Shipwreck and aircraft maps to Other Debris. Ghost Net and
+Cylinder remain valid historical dashboard groups but are not claimed as
+classes supported by this released detector.
 
 HUMAN DETECTIONS: 'human' is not one of the 5 dashboard debris categories
 (a person in the water is not debris), but detections of it are NOT

@@ -7,9 +7,11 @@ Endpoints (all under this one app):
   POST   /logs/upload                          upload a single sonar log file, starts processing
   POST   /logs/upload_dir                      upload a whole folder of frames (+ optional nav
                                                  sidecar) as one multipart request, starts processing
+  POST   /logs/upload_zip                      upload images + metadata CSV as one ZIP archive
   POST   /logs/ingest_local                    process a folder that already exists on the SERVER's
                                                  own filesystem -- no upload at all (dev/local use)
   GET    /health                                service + XTF-reader status
+  GET    /model/metadata                         released checkpoint + training metadata
   GET    /logs                                  list all processed/processing logs
   GET    /logs/{log_id}                         one log's status/summary
   GET    /logs/{log_id}/detections              detection records (the "records" area)
@@ -29,10 +31,13 @@ import queue
 import shutil
 import threading
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import cv2
+import numpy as np
 import torch
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
@@ -40,7 +45,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.backend import db_backend as db
 from src.backend.api_routes import router as frontend_api_router
+from src.backend.archive_ingestion import extract_survey_zip
 from src.backend.pipeline_runner import process_log
+from src.backend.model_release import model_metadata, validate_present_checkpoints
 from src.backend.schemas import Detection, LocalIngestRequest, LogSummary, ModelOutputStats, UploadResponse, VaeStats
 from src.geolocation.geojson_export import build_geojson, write_geojson
 from src.geolocation.xtf_reader import xtf_reader_status
@@ -89,6 +96,7 @@ app.add_middleware(
 app.include_router(frontend_api_router)
 
 _progress_queues: dict[str, "queue.Queue[dict]"] = {}
+MODEL_PATHS = {"detector": YOLO_WEIGHTS, "vae": VAE_WEIGHTS, "denoiser": B2U_WEIGHTS}
 
 
 @app.on_event("startup")
@@ -96,6 +104,9 @@ def _startup() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db(DB_PATH)
+    # Missing files remain visible through /health; a present but corrupted
+    # or substituted release file is unsafe and stops startup immediately.
+    validate_present_checkpoints(MODEL_PATHS)
     if not YOLO_WEIGHTS.exists():
         logger.warning("YOLO weights not found at %s -- set yolo_weights_path in config/backend.yaml", YOLO_WEIGHTS)
     if not VAE_WEIGHTS.exists():
@@ -132,7 +143,8 @@ def _start_log(source_path: Path, nav_sidecar_path: Optional[Path], filename: st
     log_id = str(uuid.uuid4())
     with db.get_connection(DB_PATH) as conn:
         db.create_log(conn, log_id, filename, source_format, _now_iso(), pixels_to_meters,
-                       denoise_method=denoise_method, contrast_method=contrast_method)
+                       denoise_method=denoise_method, contrast_method=contrast_method,
+                       yolo_confidence_threshold=yolo_conf)
 
     _progress_queues[log_id] = queue.Queue()
     _run_in_background(log_id, source_path, nav_sidecar_path, pixels_to_meters, yolo_conf,
@@ -177,19 +189,26 @@ def _run_in_background(log_id: str, source_path: Path, nav_sidecar_path: Optiona
 
 @app.get("/health")
 def health() -> dict:
+    checkpoint_states = validate_present_checkpoints(MODEL_PATHS)
     return {
         "status": "ok",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "models": {
-            "yolo_best_pt": {"path": str(YOLO_WEIGHTS), "found": YOLO_WEIGHTS.exists()},
-            "vae": {"path": str(VAE_WEIGHTS), "found": VAE_WEIGHTS.exists()},
-            "b2u_blind2unblind": {"path": str(B2U_WEIGHTS), "found": B2U_WEIGHTS.exists(),
+            "yolo_best_pt": checkpoint_states["detector"],
+            "vae": checkpoint_states["vae"],
+            "b2u_blind2unblind": {**checkpoint_states["denoiser"],
                                    "note": "optional -- only used when a log is uploaded with denoise_method=blind2unblind"},
             "lee_filter": {"found": True, "note": "classical, no checkpoint needed -- always available"},
         },
         "defaults": {"denoise_method": DEFAULT_DENOISE_METHOD, "contrast_method": DEFAULT_CONTRAST_METHOD},
         "xtf": xtf_reader_status(),
     }
+
+
+@app.get("/model/metadata")
+def get_model_metadata() -> dict:
+    """Immutable training facts plus local checkpoint/device status."""
+    return model_metadata(MODEL_PATHS)
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +317,36 @@ async def upload_log_directory(
                        pixels_to_meters, yolo_conf, denoise_method, contrast_method)
 
 
+@app.post("/logs/upload_zip", response_model=UploadResponse)
+async def upload_log_zip(
+    archive: UploadFile = File(..., description="ZIP containing sonar images and one navigation metadata CSV."),
+    pixels_to_meters: float = DEFAULT_PIXELS_TO_METERS,
+    yolo_conf: float = DEFAULT_YOLO_CONF,
+    denoise_method: str = DEFAULT_DENOISE_METHOD,
+    contrast_method: str = DEFAULT_CONTRAST_METHOD,
+) -> UploadResponse:
+    """Safely unpack and process a complete exported survey archive."""
+    _validate_processing_params(denoise_method, contrast_method)
+    if Path(archive.filename or "").suffix.lower() != ".zip":
+        raise HTTPException(422, "Complete survey upload must be a .zip file.")
+
+    log_dir = UPLOAD_DIR / uuid.uuid4().hex
+    log_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = log_dir / "survey.zip"
+    try:
+        with archive_path.open("wb") as output:
+            shutil.copyfileobj(archive.file, output)
+        frames_dir, metadata_path, _image_count = extract_survey_zip(archive_path, log_dir / "extracted")
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        shutil.rmtree(log_dir, ignore_errors=True)
+        raise HTTPException(422, str(exc)) from exc
+
+    return _start_log(
+        frames_dir, metadata_path, archive.filename or "survey.zip", "zip+metadata",
+        pixels_to_meters, yolo_conf, denoise_method, contrast_method,
+    )
+
+
 @app.post("/logs/ingest_local", response_model=UploadResponse)
 def ingest_local_directory(req: LocalIngestRequest) -> UploadResponse:
     """Process a folder that ALREADY exists on the SERVER's own filesystem --
@@ -383,7 +432,7 @@ def _require_log(log_id: str) -> dict:
 
 @app.get("/logs/{log_id}/stats", response_model=ModelOutputStats)
 def get_model_stats(log_id: str) -> ModelOutputStats:
-    _require_log(log_id)
+    log = _require_log(log_id)
     with db.get_connection(DB_PATH) as conn:
         detections = db.list_detections(conn, log_id)
 
@@ -400,8 +449,14 @@ def get_model_stats(log_id: str) -> ModelOutputStats:
 
     return ModelOutputStats(
         log_id=log_id, n_detections=len(detections), counts_by_class=counts,
+        raw_counts_by_class=counts,
         mean_confidence_by_class=mean_conf, n_low_confidence=n_low,
         low_confidence_threshold=DEFAULT_LOW_CONF_THRESHOLD,
+        confidence_threshold=log.get("yolo_confidence_threshold"),
+        mean_inference_ms=(round(log["detector_inference_ms"] / log["detector_frames"], 2)
+                           if log.get("detector_inference_ms") is not None and log.get("detector_frames") else None),
+        fps=(round(1000.0 / (log["detector_inference_ms"] / log["detector_frames"]), 2)
+             if log.get("detector_inference_ms") and log.get("detector_frames") else None),
     )
 
 
@@ -413,18 +468,13 @@ def get_model_stats(log_id: str) -> ModelOutputStats:
 def get_vae_stats(log_id: str) -> VaeStats:
     _require_log(log_id)
     with db.get_connection(DB_PATH) as conn:
-        detections = db.list_detections(conn, log_id)
+        stored_frames = db.list_frame_analyses(conn, log_id)
 
-    # one whole_image_error per frame -- dedupe by frame_record_id
-    by_frame: dict[str, dict] = {}
-    for d in detections:
-        by_frame.setdefault(d["frame_record_id"], {
-            "frame_record_id": d["frame_record_id"],
-            "whole_image_error": d["vae_whole_image_error"],
-            "percentile": d["vae_whole_image_percentile"],
-        })
-
-    frames = list(by_frame.values())
+    frames = [{
+        "frame_record_id": frame["frame_record_id"],
+        "whole_image_error": frame["whole_image_error"],
+        "percentile": frame["percentile"],
+    } for frame in stored_frames]
     if not frames:
         return VaeStats(log_id=log_id, n_frames_analyzed=0, mean_whole_image_error=0.0,
                          min_whole_image_error=0.0, max_whole_image_error=0.0, most_anomalous_frames=[])
@@ -439,6 +489,24 @@ def get_vae_stats(log_id: str) -> VaeStats:
         max_whole_image_error=round(max(errors), 6) if errors else 0.0,
         most_anomalous_frames=most_anomalous,
     )
+
+
+@app.get("/logs/{log_id}/frames/{frame_record_id}/vae/surface")
+def get_vae_surface_data(log_id: str, frame_record_id: str) -> dict:
+    """Compact normalized reconstruction-error grid for the interactive 3D viewer."""
+    _require_log(log_id)
+    frame_dir = OUTPUT_DIR / log_id / "vae" / frame_record_id
+    original = cv2.imread(str(frame_dir / "01_original.png"), cv2.IMREAD_GRAYSCALE)
+    reconstruction = cv2.imread(str(frame_dir / "02_reconstruction.png"), cv2.IMREAD_GRAYSCALE)
+    if original is None or reconstruction is None:
+        raise HTTPException(404, f"VAE source panels not found for frame {frame_record_id}")
+    size = 56
+    original = cv2.resize(original, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
+    reconstruction = cv2.resize(reconstruction, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
+    difference = np.abs(original - reconstruction) / 255.0
+    scale = max(float(np.percentile(difference, 98)), 0.001)
+    normalized = np.clip(difference / scale, 0.0, 1.0)
+    return {"size": size, "values": np.round(normalized, 5).reshape(-1).tolist()}
 
 
 @app.get("/logs/{log_id}/frames/{frame_record_id}/vae/{filename}")

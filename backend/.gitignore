@@ -15,6 +15,7 @@ sonarsense.db
 sonarsense_test.db
 backend_uploads/
 backend_outputs/
+runtime/
 outputs/
 runs/
 eval_out/

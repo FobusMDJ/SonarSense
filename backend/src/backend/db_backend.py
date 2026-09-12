@@ -63,8 +63,10 @@ def configure(cfg: dict, project_root: Optional[Path] = None) -> Any:
         from src.backend import db as _db
         _active_module = _db
         _target_kwarg = "db_path"
-        rel = cfg.get("db_path", str(_db.DEFAULT_DB_PATH))
-        _default_target = (Path(project_root) / rel) if project_root is not None else Path(rel)
+        rel = os.environ.get("SQLITE_DB_PATH") or cfg.get("db_path", str(_db.DEFAULT_DB_PATH))
+        rel_path = Path(rel)
+        _default_target = ((Path(project_root) / rel_path) if project_root is not None and not rel_path.is_absolute()
+                           else rel_path)
     elif backend == "postgres":
         from src.backend import db_postgis as _db
         _active_module = _db

@@ -86,9 +86,59 @@ export interface ModelOutputStats {
   log_id: string
   n_detections: number
   counts_by_class: Record<string, number>
+  raw_counts_by_class: Record<string, number>
   mean_confidence_by_class: Record<string, number>
   n_low_confidence: number
   low_confidence_threshold: number
+  confidence_threshold: number | null
+  mean_inference_ms: number | null
+  fps: number | null
+}
+
+export interface CheckpointMetadata {
+  filename: string
+  size_bytes: number
+  sha256: string
+  path: string
+  found: boolean
+  verified: boolean
+  actual_sha256: string | null
+}
+
+export interface ModelMetadata {
+  release_tag: string
+  device: string
+  detector: {
+    name: string
+    framework: string
+    framework_version: string
+    input_size: number
+    training_epochs: number
+    training_images: number | null
+    raw_classes: string[]
+    training_metrics: {
+      precision: number
+      recall: number
+      f1_score: number
+      map50: number
+      map50_95: number
+    }
+    checkpoint: CheckpointMetadata
+  }
+  vae: {
+    epoch: number
+    input_size: number
+    latent_dim: number
+    channels: number[]
+    checkpoint: CheckpointMetadata
+  }
+  denoiser: {
+    name: string
+    status: 'experimental'
+    epoch: number
+    base_width: number
+    checkpoint: CheckpointMetadata
+  }
 }
 
 export interface VaeFrameStat {
@@ -147,6 +197,10 @@ export function getModelStats(logId: string): Promise<ModelOutputStats> {
   return request(`/logs/${logId}/stats`)
 }
 
+export function getModelMetadata(): Promise<ModelMetadata> {
+  return request('/model/metadata')
+}
+
 export function getVaeStats(logId: string): Promise<VaeStats> {
   return request(`/logs/${logId}/vae_stats`)
 }
@@ -155,6 +209,15 @@ export function getVaeStats(logId: string): Promise<VaeStats> {
  * one frame -- used as an <img src>, not fetched via request() above. */
 export function vaeFrameImageUrl(logId: string, frameRecordId: string, filename: string): string {
   return `${API_BASE}/logs/${logId}/frames/${frameRecordId}/vae/${filename}`
+}
+
+export interface VaeSurfaceData {
+  size: number
+  values: number[]
+}
+
+export function getVaeSurfaceData(logId: string, frameRecordId: string): Promise<VaeSurfaceData> {
+  return request(`/logs/${logId}/frames/${encodeURIComponent(frameRecordId)}/vae/surface`)
 }
 
 export function reportUrls(logId: string) {
@@ -198,6 +261,18 @@ export async function uploadLog(file: File, opts: UploadOptions = {}): Promise<U
   if (opts.contrastMethod) params.set('contrast_method', opts.contrastMethod)
   const qs = params.toString() ? `?${params.toString()}` : ''
   return request(`/logs/upload${qs}`, { method: 'POST', body: form })
+}
+
+export async function uploadSurveyZip(archive: File, opts: Omit<UploadOptions, 'navSidecar'> = {}): Promise<UploadResponse> {
+  const form = new FormData()
+  form.append('archive', archive)
+  const params = new URLSearchParams()
+  if (opts.pixelsToMeters != null) params.set('pixels_to_meters', String(opts.pixelsToMeters))
+  if (opts.yoloConf != null) params.set('yolo_conf', String(opts.yoloConf))
+  if (opts.denoiseMethod) params.set('denoise_method', opts.denoiseMethod)
+  if (opts.contrastMethod) params.set('contrast_method', opts.contrastMethod)
+  const qs = params.toString() ? `?${params.toString()}` : ''
+  return request(`/logs/upload_zip${qs}`, { method: 'POST', body: form })
 }
 
 /** Opens the log's live progress WebSocket. Every callback is optional;

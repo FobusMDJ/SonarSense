@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS logs (
     pixels_to_meters REAL,
     denoise_method TEXT,               -- 'none' | 'lee' | 'blind2unblind' -- what THIS log was actually run with
     contrast_method TEXT,              -- 'none' | 'clahe' | 'histeq'
+    yolo_confidence_threshold REAL,
+    detector_inference_ms REAL,
+    detector_frames INTEGER NOT NULL DEFAULT 0,
     error_message TEXT
 );
 
@@ -62,7 +65,18 @@ CREATE TABLE IF NOT EXISTS detections (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS frame_analyses (
+    log_id TEXT NOT NULL REFERENCES logs(id),
+    frame_index INTEGER NOT NULL,
+    frame_record_id TEXT NOT NULL,
+    whole_image_error REAL,
+    percentile REAL,
+    vae_panel_dir TEXT NOT NULL,
+    PRIMARY KEY (log_id, frame_record_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_log_id ON detections(log_id);
+CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
 """
 
 
@@ -74,6 +88,12 @@ _DETECTIONS_MIGRATIONS = [
     ("depth_m", "REAL"),
 ]
 
+_LOG_MIGRATIONS = [
+    ("yolo_confidence_threshold", "REAL"),
+    ("detector_inference_ms", "REAL"),
+    ("detector_frames", "INTEGER NOT NULL DEFAULT 0"),
+]
+
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(detections)").fetchall()}
@@ -81,6 +101,11 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         if col_name not in existing:
             conn.execute(f"ALTER TABLE detections ADD COLUMN {col_name} {col_type}")
             logger.info("Migrated detections table: added column %s %s", col_name, col_type)
+    existing_logs = {row[1] for row in conn.execute("PRAGMA table_info(logs)").fetchall()}
+    for col_name, col_type in _LOG_MIGRATIONS:
+        if col_name not in existing_logs:
+            conn.execute(f"ALTER TABLE logs ADD COLUMN {col_name} {col_type}")
+            logger.info("Migrated logs table: added column %s %s", col_name, col_type)
 
 
 def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> None:
@@ -112,11 +137,13 @@ def get_connection(db_path: str | Path = DEFAULT_DB_PATH) -> Iterator[sqlite3.Co
 
 def create_log(conn: sqlite3.Connection, log_id: str, filename: str, source_format: str,
                 uploaded_at: str, pixels_to_meters: Optional[float] = None,
-                denoise_method: Optional[str] = None, contrast_method: Optional[str] = None) -> None:
+                denoise_method: Optional[str] = None, contrast_method: Optional[str] = None,
+                yolo_confidence_threshold: Optional[float] = None) -> None:
     conn.execute(
         "INSERT INTO logs (id, filename, source_format, status, uploaded_at, pixels_to_meters, "
-        "denoise_method, contrast_method) VALUES (?, ?, ?, 'uploaded', ?, ?, ?, ?)",
-        (log_id, filename, source_format, uploaded_at, pixels_to_meters, denoise_method, contrast_method),
+        "denoise_method, contrast_method, yolo_confidence_threshold) VALUES (?, ?, ?, 'uploaded', ?, ?, ?, ?, ?)",
+        (log_id, filename, source_format, uploaded_at, pixels_to_meters, denoise_method, contrast_method,
+         yolo_confidence_threshold),
     )
 
 
@@ -133,6 +160,11 @@ def update_log_counts(conn: sqlite3.Connection, log_id: str, n_frames: int, n_de
     conn.execute("UPDATE logs SET n_frames = ?, n_detections = ? WHERE id = ?", (n_frames, n_detections, log_id))
 
 
+def update_log_performance(conn: sqlite3.Connection, log_id: str, inference_ms: float, frames: int) -> None:
+    conn.execute("UPDATE logs SET detector_inference_ms = ?, detector_frames = ? WHERE id = ?",
+                 (inference_ms, frames, log_id))
+
+
 def get_log(conn: sqlite3.Connection, log_id: str) -> Optional[dict]:
     row = conn.execute("SELECT * FROM logs WHERE id = ?", (log_id,)).fetchone()
     return dict(row) if row else None
@@ -141,6 +173,23 @@ def get_log(conn: sqlite3.Connection, log_id: str) -> Optional[dict]:
 def list_logs(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT * FROM logs ORDER BY uploaded_at DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def insert_frame_analysis(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO frame_analyses "
+        "(log_id, frame_index, frame_record_id, whole_image_error, percentile, vae_panel_dir) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (row["log_id"], row["frame_index"], row["frame_record_id"], row["whole_image_error"],
+         row["percentile"], row["vae_panel_dir"]),
+    )
+
+
+def list_frame_analyses(conn: sqlite3.Connection, log_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM frame_analyses WHERE log_id = ? ORDER BY frame_index", (log_id,)
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 # --------------------------------------------------------------------------
