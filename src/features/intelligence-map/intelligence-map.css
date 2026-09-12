@@ -55,6 +55,10 @@
 .ss-menu-button { display: none; }
 
 .ss-main { min-width: 0; min-height: 0; max-width: none; margin: 0; padding: 0; display: grid; grid-template-rows: 54px minmax(0, 1fr); }
+.ss-main-empty { position: relative; min-width: 0; min-height: 0; }
+.ss-survey-picker { color: var(--ss-text); border: 1px solid var(--ss-line-soft); background: #0a1b25; font: 500 10px 'IBM Plex Mono', monospace; padding: 2px 6px; }
+.ss-back-link { color: var(--ss-muted); text-decoration: none; font: 500 10px 'IBM Plex Mono', monospace; padding: 8px 10px; border: 1px solid var(--ss-line); }
+.ss-back-link:hover { color: var(--ss-text); border-color: #4f747b; }
 .ss-summary { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 20px; border-bottom: 1px solid var(--ss-line); background: linear-gradient(90deg, #0b1b25, #081720); }
 .ss-summary__identity { min-width: 0; display: flex; align-items: center; gap: 12px; }
 .ss-kicker { color: var(--ss-cyan); font: 600 8px 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: .13em; }

@@ -1,5 +1,7 @@
-import { useEffect, useRef } from 'react'
+import { vaeFrameImageUrl } from '../lib/api'
+// (useEffect/useRef no longer needed here -- AnomalyPreview now renders real backend images.)
 import { categories, type DetectionRecord } from './data'
+import type { AnomalousFrame } from './useSonarData'
 
 export function Sparkline({ color, variant = 0 }: { color: string; variant?: number }) {
   const paths = [
@@ -27,13 +29,22 @@ export function TypeChart({ items }: { items: DetectionRecord[] }) {
   })}</ul></div>
 }
 
-export function TimelineChart({ compact = false }: { compact?: boolean }) {
-  const values = [40, 32, 53, 65, 28, 42, 57]
-  return <svg className={`ds-timeline ${compact ? 'is-large' : ''}`} viewBox="0 0 430 204" role="img" aria-label="Detections over time: May 15, 40; May 16, 32; May 17, 53; May 18, 65; May 19, 28; May 20, 42; May 21, 57.">
-    {[0, 20, 40, 60, 80].map(n => <g key={n}><line x1="33" x2="418" y1={169 - n * 1.85} y2={169 - n * 1.85} stroke="#17232e" strokeWidth=".7"/><text x="4" y={173 - n * 1.85}>{n}</text></g>)}
+export interface TimelinePoint { label: string; count: number }
+
+export function TimelineChart({ series }: { series: TimelinePoint[] }) {
+  if (series.length === 0) {
+    return <div className="ds-no-results"><strong>No detections yet</strong><p>Upload a sonar log to see detections plotted over time.</p></div>
+  }
+  const values = series.map(s => s.count)
+  const maximum = Math.max(1, ...values)
+  const stepX = values.length > 1 ? 382 / (values.length - 1) : 0
+  const yFor = (n: number) => 169 - (n / maximum) * 151
+  const gridValues = [0, 0.25, 0.5, 0.75, 1].map(f => Math.round(maximum * f))
+  return <svg className="ds-timeline" viewBox="0 0 430 204" role="img" aria-label={`Detections over time: ${series.map(s => `${s.label}, ${s.count}`).join('; ')}.`}>
+    {gridValues.map(n => <g key={n}><line x1="33" x2="418" y1={yFor(n)} y2={yFor(n)} stroke="#17232e" strokeWidth=".7"/><text x="4" y={yFor(n) + 4}>{n}</text></g>)}
     <path d="M33 18V169H418" fill="none" stroke="#617181" strokeWidth=".7" />
-    <polyline points={values.map((n, i) => `${36 + i * 62},${169 - n * 1.85}`).join(' ')} fill="none" stroke="#5c85ee" strokeWidth="1.8" />
-    {values.map((n, i) => <g key={i}><circle cx={36 + i * 62} cy={169 - n * 1.85} r="5.5" fill="#345ccd" opacity=".38"/><circle cx={36 + i * 62} cy={169 - n * 1.85} r="2.8" fill="#e3efff" stroke="#7d9eff"><title>May {15 + i}: {n} detections</title></circle><text x={36 + i * 62} y="191" textAnchor="middle">May {15 + i}</text></g>)}
+    <polyline points={values.map((n, i) => `${36 + i * stepX},${yFor(n)}`).join(' ')} fill="none" stroke="#5c85ee" strokeWidth="1.8" />
+    {values.map((n, i) => <g key={i}><circle cx={36 + i * stepX} cy={yFor(n)} r="5.5" fill="#345ccd" opacity=".38"/><circle cx={36 + i * stepX} cy={yFor(n)} r="2.8" fill="#e3efff" stroke="#7d9eff"><title>{series[i].label}: {n} detections</title></circle><text x={36 + i * stepX} y="191" textAnchor="middle">{series[i].label}</text></g>)}
   </svg>
 }
 
@@ -50,34 +61,20 @@ export function ConfidenceChart({ items }: { items: DetectionRecord[] }) {
   </svg>
 }
 
-export function AnomalyPreview() {
-  const ref = useRef<HTMLCanvasElement>(null)
-  useEffect(() => {
-    const context = ref.current?.getContext('2d')
-    if (!context) return
-    const width = 560, height = 240
-    const pixels = context.createImageData(width, height)
-    let seed = 1742
-    const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 }
-    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-      const p = (y * width + x) * 4
-      if (x < 278) {
-        const distance = Math.abs(x - 139)
-        let signal = distance < 13 ? 3 : (0.18 + rand() ** 3 * .8) * (70 + 125 * Math.exp(-distance / 55))
-        const object = Math.exp(-((x - 72) ** 2 / 150 + (y - 157) ** 2 / 690))
-        signal += object * rand() * 150
-        pixels.data[p] = signal * .96; pixels.data[p + 1] = signal; pixels.data[p + 2] = signal * .99
-      } else {
-        const fx = x - 278
-        let heat = 0
-        for (const [cx, cy, scale] of [[98, 127, 1], [56, 156, .6], [133, 106, .8], [153, 163, .4]]) heat += scale * Math.exp(-((fx - cx) ** 2 / 240 + (y - cy) ** 2 / 190))
-        heat = Math.min(1, heat + Math.max(0, Math.sin(fx / 8) * Math.cos(y / 11)) * .08 + rand() * .07)
-        const rgb = heat < .25 ? [0, heat * 130, 80 + heat * 540] : heat < .5 ? [0, (heat - .25) * 1020, 220] : heat < .75 ? [(heat - .5) * 1020, 230, 200 - (heat - .5) * 800] : [255, 220 - (heat - .75) * 780, 0]
-        pixels.data[p] = rgb[0]; pixels.data[p + 1] = rgb[1]; pixels.data[p + 2] = rgb[2]
-      }
-      pixels.data[p + 3] = 255
-    }
-    context.putImageData(pixels, 0, 0)
-  }, [])
-  return <div className="ds-anomaly"><canvas ref={ref} width="560" height="240" role="img" aria-label="Mock side-scan sonar intensity on the left and VAE anomaly heatmap on the right"/><div className="ds-heat-legend"><span>Low</span><i/><span>High</span></div></div>
+export function AnomalyPreview({ frames, meanError }: { frames: AnomalousFrame[]; meanError: number | null }) {
+  const top = frames[0]
+  if (!top) {
+    return <div className="ds-no-results"><strong>No VAE analysis yet</strong><p>Upload a sonar log to see real anomaly-detection output here.</p></div>
+  }
+  return (
+    <div className="ds-anomaly ds-anomaly-real">
+      <img src={vaeFrameImageUrl(top.logId, top.frameRecordId, '01_original.png')} alt="Preprocessed input frame" />
+      <img src={vaeFrameImageUrl(top.logId, top.frameRecordId, '03_anomaly_overlay.png')} alt="VAE anomaly overlay" />
+      <div className="ds-heat-legend"><span>Low</span><i/><span>High</span></div>
+      <dl className="ds-anomaly-stats">
+        <div><dt>Most anomalous frame error</dt><dd>{top.wholeImageError?.toFixed(6) ?? 'n/a'}</dd></div>
+        <div><dt>Mean error (all logs)</dt><dd>{meanError != null ? meanError.toFixed(6) : 'n/a'}</dd></div>
+      </dl>
+    </div>
+  )
 }

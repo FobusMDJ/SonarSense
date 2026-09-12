@@ -40,7 +40,7 @@ export function DetectionDetails({ detection, onClose }: DetectionDetailsProps) 
         <div><dt><Waves size={16} />Depth</dt><dd>{detection.depth.toFixed(1)} m</dd></div>
         <div><dt><Crosshair size={16} />Coordinates</dt><dd>{formatCoordinate(detection.coordinates[1], 'N', 'S')}<br />{formatCoordinate(detection.coordinates[0], 'E', 'W')}</dd></div>
       </dl>
-      <p className="ss-details__note">Survey-derived observation from the demonstration dataset. No review or evidence actions are available in this step.</p>
+      <p className="ss-details__note">Detected and geolocated by the SonarSense backend pipeline (YOLO26 + VAE anomaly analysis + confidence scoring + navigation-fix geolocation).</p>
     </aside>
   )
 }
