@@ -1,0 +1,55 @@
+# Render Blueprint: deploys the backend, frontend, and a PostGIS-enabled
+# Postgres database together. In the Render dashboard: New -> Blueprint,
+# point it at this repo, and it reads this file automatically (must live
+# at the repo root, which is why it's here and not under backend/).
+#
+# After the first deploy, set these two secrets on the sonarsense-backend
+# service (Render dashboard -> service -> Environment) -- they're marked
+# `sync: false` below so Render prompts for them instead of expecting them
+# in this committed file:
+#   YOLO_WEIGHTS_URL  -> direct-download URL for your best.pt
+#   VAE_WEIGHTS_URL   -> direct-download URL for vae_epoch100.pth
+# (see backend/docker-entrypoint.sh for what these do)
+#
+# The database's connection string is wired to the backend automatically
+# via fromDatabase below -- no DSN is ever written into this file or into
+# config/backend.yaml. Enabling PostGIS on the database itself still
+# happens automatically too: src/backend/db_postgis.py's init_db() runs
+# `CREATE EXTENSION IF NOT EXISTS postgis` on startup.
+
+databases:
+  - name: sonarsense-db
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: sonarsense-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: DB_BACKEND
+        value: postgres
+      - key: POSTGRES_DSN
+        fromDatabase:
+          name: sonarsense-db
+          property: connectionString
+      - key: YOLO_WEIGHTS_URL
+        sync: false
+      - key: VAE_WEIGHTS_URL
+        sync: false
+
+  - type: web
+    name: sonarsense-frontend
+    runtime: static
+    buildCommand: pnpm install && pnpm build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false  # set this to sonarsense-backend's URL after its first deploy
+        # (Render assigns the backend's URL only once it exists, so this
+        # can't be wired automatically on a first-ever deploy of both
+        # services together -- set it once, then every later deploy keeps it)
