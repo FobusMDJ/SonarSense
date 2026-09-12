@@ -1,5 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import maplibregl, { type GeoJSONSource, type Map, type MapGeoJSONFeature, type MapMouseEvent, type StyleSpecification } from 'maplibre-gl'
+import type { FeatureCollection, LineString } from 'geojson'
 import { Crosshair, Maximize2, Minus, Plus } from 'lucide-react'
 import type { Detection, Survey } from '../types'
 import { detectionsToGeoJSON, getSurveyBounds, surveyTrackToGeoJSON } from '../services/mapDataAdapter'
@@ -65,6 +66,61 @@ const createTerminalMarker = (label: string, className: string) => {
   return marker
 }
 
+type CoordinateGridProperties = {
+  axis: 'latitude' | 'longitude'
+  label: string
+}
+
+const coordinateSteps = [
+  .0001, .0002, .0005, .001, .002, .005, .01, .02, .05, .1, .2, .5,
+  1, 2, 5, 10, 20, 30, 45, 90,
+]
+
+function gridStepFor(map: Map) {
+  const bounds = map.getBounds()
+  const span = Math.max(bounds.getEast() - bounds.getWest(), bounds.getNorth() - bounds.getSouth())
+  const target = Math.max(.0001, span / 8)
+  return coordinateSteps.find((step) => step >= target) ?? 90
+}
+
+function coordinateLabel(value: number, axis: CoordinateGridProperties['axis'], step: number) {
+  const decimals = step < .001 ? 4 : step < .01 ? 3 : step < .1 ? 2 : step < 1 ? 1 : 0
+  const direction = axis === 'latitude'
+    ? (value >= 0 ? 'N' : 'S')
+    : (value >= 0 ? 'E' : 'W')
+  return `${Math.abs(value).toFixed(decimals)}°${direction}`
+}
+
+function coordinateGridFor(map: Map): FeatureCollection<LineString, CoordinateGridProperties> {
+  const bounds = map.getBounds()
+  const west = Math.max(-180, bounds.getWest())
+  const east = Math.min(180, bounds.getEast())
+  const south = Math.max(-85, bounds.getSouth())
+  const north = Math.min(85, bounds.getNorth())
+  const step = gridStepFor(map)
+  const features: FeatureCollection<LineString, CoordinateGridProperties>['features'] = []
+
+  for (let longitude = Math.ceil(west / step) * step; longitude <= east; longitude += step) {
+    const value = Number(longitude.toFixed(7))
+    features.push({
+      type: 'Feature',
+      properties: { axis: 'longitude', label: coordinateLabel(value, 'longitude', step) },
+      geometry: { type: 'LineString', coordinates: [[value, south], [value, north]] },
+    })
+  }
+
+  for (let latitude = Math.ceil(south / step) * step; latitude <= north; latitude += step) {
+    const value = Number(latitude.toFixed(7))
+    features.push({
+      type: 'Feature',
+      properties: { axis: 'latitude', label: coordinateLabel(value, 'latitude', step) },
+      geometry: { type: 'LineString', coordinates: [[west, value], [east, value]] },
+    })
+  }
+
+  return { type: 'FeatureCollection', features }
+}
+
 export const MarineIntelligenceMap = forwardRef<MarineIntelligenceMapHandle, MarineIntelligenceMapProps>(
   function MarineIntelligenceMap({ survey, detections, allDetections, onSelect }, ref) {
     const containerRef = useRef<HTMLDivElement>(null)
@@ -81,8 +137,11 @@ export const MarineIntelligenceMap = forwardRef<MarineIntelligenceMapHandle, Mar
       const map = mapRef.current
       if (!map) return
       const bounds = getSurveyBounds(survey, allDetections)
+      const compact = map.getContainer().clientWidth < 700
       map.fitBounds([[bounds.west, bounds.south], [bounds.east, bounds.north]], {
-        padding: { top: 72, right: 82, bottom: 72, left: 340 },
+        padding: compact
+          ? { top: 84, right: 46, bottom: 86, left: 46 }
+          : { top: 72, right: 82, bottom: 72, left: 340 },
         duration: 850,
         maxZoom: 12,
       })
@@ -139,7 +198,40 @@ export const MarineIntelligenceMap = forwardRef<MarineIntelligenceMapHandle, Mar
         popup.remove()
       }
 
+      const updateCoordinateGrid = () => {
+        const source = map.getSource('coordinate-grid') as GeoJSONSource | undefined
+        source?.setData(coordinateGridFor(map))
+      }
+
       map.on('load', () => {
+        map.addSource('coordinate-grid', { type: 'geojson', data: coordinateGridFor(map) })
+        map.addLayer({
+          id: 'coordinate-grid-lines', type: 'line', source: 'coordinate-grid',
+          paint: {
+            'line-color': '#b9dce1',
+            'line-width': 1,
+            'line-opacity': .22,
+            'line-dasharray': [2, 3],
+          },
+        })
+        map.addLayer({
+          id: 'coordinate-grid-labels', type: 'symbol', source: 'coordinate-grid',
+          layout: {
+            'symbol-placement': 'line',
+            'symbol-spacing': 360,
+            'text-field': ['get', 'label'],
+            'text-font': ['Open Sans Regular'],
+            'text-size': 9,
+            'text-letter-spacing': .08,
+            'text-allow-overlap': false,
+          },
+          paint: {
+            'text-color': '#c6e0e2',
+            'text-halo-color': '#061019',
+            'text-halo-width': 1.2,
+            'text-opacity': .72,
+          },
+        })
         map.addSource('survey-track', { type: 'geojson', data: surveyTrackToGeoJSON(survey) })
         map.addLayer({
           id: 'survey-track-casing', type: 'line', source: 'survey-track',
@@ -196,6 +288,8 @@ export const MarineIntelligenceMap = forwardRef<MarineIntelligenceMapHandle, Mar
         map.on('mouseleave', 'detection-points', onLeave)
         map.on('mouseenter', 'detection-clusters', () => { map.getCanvas().style.cursor = 'pointer' })
         map.on('mouseleave', 'detection-clusters', onLeave)
+        map.on('moveend', updateCoordinateGrid)
+        map.addControl(new maplibregl.ScaleControl({ maxWidth: 130, unit: 'metric' }), 'bottom-right')
         map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
         setReady(true)
         window.setTimeout(fitSurvey, 80)

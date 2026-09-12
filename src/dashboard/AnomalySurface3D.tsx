@@ -101,6 +101,7 @@ export default function AnomalySurface3D({ logId, frameRecordId, fallbackUrl }: 
 
   useEffect(() => () => data?.geometry.dispose(), [data])
   const status = useMemo(() => probe == null ? 'Move over the terrain to inspect anomaly intensity' : `Anomaly intensity ${Math.round(probe * 100)}%`, [probe])
+  const scaleTicks = [100, 75, 50, 25, 0]
 
   if (error) return (
     <div className="ds-surface-fallback">
@@ -110,7 +111,7 @@ export default function AnomalySurface3D({ logId, frameRecordId, fallbackUrl }: 
   )
 
   return (
-    <div className="ds-surface-shell" role="img" aria-label="Interactive 3D reconstruction-error surface">
+    <section className="ds-surface-shell" aria-label="Interactive 3D reconstruction-error surface">
       <div className="ds-surface-toolbar">
         <div><strong>Interactive anomaly terrain</strong><span>Drag to orbit · scroll or pinch to zoom</span></div>
         <label htmlFor="surface-height">Peak height
@@ -122,23 +123,35 @@ export default function AnomalySurface3D({ logId, frameRecordId, fallbackUrl }: 
       <div className="ds-surface-canvas">
         {!data && <div className="ds-surface-loading">Building reconstruction-error terrain…</div>}
         {data && (
-          <Canvas
-            camera={{ position: [5.2, 4.2, 5.6], fov: 39, near: .1, far: 100 }}
-            dpr={[1, 1.5]}
-            frameloop="demand"
-            fallback={<img src={fallbackUrl} alt="Static 3D anomaly surface fallback" />}
-          >
-            <color attach="background" args={['#040b13']} />
-            <ambientLight intensity={.9} />
-            <directionalLight position={[3, 7, 4]} intensity={2.2} color="#d9f4ff" />
-            <directionalLight position={[-5, 2, -2]} intensity={1.1} color="#1e91b8" />
-            <gridHelper args={[8, 16, '#36566f', '#152d40']} position={[0, -.04, 0]} />
-            <Surface data={data} heightScale={heightScale} onProbe={setProbe} />
-            <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={.08} minDistance={4.5} maxDistance={12} minPolarAngle={.25} maxPolarAngle={Math.PI / 2.04} />
-          </Canvas>
+          <>
+            <Canvas
+              camera={{ position: [5.2, 4.2, 5.6], fov: 39, near: .1, far: 100 }}
+              dpr={[1, 1.5]}
+              frameloop="demand"
+              fallback={<img src={fallbackUrl} alt="Static 3D anomaly surface fallback" />}
+            >
+              <color attach="background" args={['#040b13']} />
+              <ambientLight intensity={.9} />
+              <directionalLight position={[3, 7, 4]} intensity={2.2} color="#d9f4ff" />
+              <directionalLight position={[-5, 2, -2]} intensity={1.1} color="#1e91b8" />
+              <gridHelper args={[8, 16, '#36566f', '#152d40']} position={[0, -.04, 0]} />
+              <Surface data={data} heightScale={heightScale} onProbe={setProbe} />
+              <OrbitControls ref={controls} makeDefault enableDamping dampingFactor={.08} minDistance={4.5} maxDistance={12} minPolarAngle={.25} maxPolarAngle={Math.PI / 2.04} />
+            </Canvas>
+            <aside className="ds-surface-scale" aria-label={`Anomaly intensity scale from 0 to 100 percent${probe == null ? '' : `; selected value ${Math.round(probe * 100)} percent`}`}>
+              <strong>Anomaly score</strong>
+              <div className="ds-surface-scale__meter" aria-hidden="true">
+                {probe != null && <i style={{ bottom: `${probe * 100}%` }} />}
+              </div>
+              <div className="ds-surface-scale__ticks" aria-hidden="true">
+                {scaleTicks.map(tick => <span key={tick}>{tick}%</span>)}
+              </div>
+              <small>High</small><small>Low</small>
+            </aside>
+          </>
         )}
       </div>
       <div className="ds-surface-status" aria-live="polite"><span>{status}</span><i aria-hidden="true" /></div>
-    </div>
+    </section>
   )
 }
