@@ -3,12 +3,16 @@
 # point it at this repo, and it reads this file automatically (must live
 # at the repo root, which is why it's here and not under backend/).
 #
-# After the first deploy, set these two secrets on the sonarsense-backend
+# After the first deploy, set these secrets on the sonarsense-backend
 # service (Render dashboard -> service -> Environment) -- they're marked
 # `sync: false` below so Render prompts for them instead of expecting them
 # in this committed file:
 #   YOLO_WEIGHTS_URL  -> direct-download URL for your best.pt
 #   VAE_WEIGHTS_URL   -> direct-download URL for vae_epoch100.pth
+#   B2U_WEIGHTS_URL   -> direct-download URL for B2Ueph2.pth (OPTIONAL --
+#                        only needed if you plan to use denoise_method=
+#                        blind2unblind on an upload; leave blank otherwise,
+#                        docker-entrypoint.sh just skips it when unset)
 # (see backend/docker-entrypoint.sh for what these do)
 #
 # The database's connection string is wired to the backend automatically
@@ -40,6 +44,8 @@ services:
       - key: YOLO_WEIGHTS_URL
         sync: false
       - key: VAE_WEIGHTS_URL
+        sync: false
+      - key: B2U_WEIGHTS_URL
         sync: false
 
   - type: web
