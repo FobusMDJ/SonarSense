@@ -12,7 +12,6 @@ export function SurveySummary({ survey, summary }: SurveySummaryProps) {
       <div className="ss-summary__identity">
         <span className="ss-kicker">{survey.id}</span>
         <strong>{survey.name}</strong>
-        <span className="ss-demo-badge">Demo Dataset</span>
       </div>
       <div className="ss-summary__metrics">
         <span><Anchor size={15} aria-hidden="true" />{survey.platform}</span>
