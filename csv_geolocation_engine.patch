@@ -1,0 +1,1261 @@
+From 76d801e4221ddf869e5e24b7e614a16c951dbfaa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 12 Sep 2026 17:18:41 +0000
+Subject: [PATCH] Add CSV-based geolocation engine, unified into the detections
+ table
+
+Wires the uploaded geolocation_engine.py in as a second ingestion path
+(POST /logs/geolocate_csv) for detections already produced by an external/
+offline detector, joined against a nav CSV by ping_id. Results are written
+into the same `detections` table as the image/YOLO/VAE pipeline (source_
+format="csv_detections"), so they appear in /map, /detections, and reports
+identically regardless of source.
+
+Fixes one bug found relative to the uploaded script: depth_m now includes
+altitude_m (object depth = vehicle depth + altitude, since the object rests
+near the seafloor below the vehicle), matching the intended physical model
+instead of just relaying the vehicle's own depth.
+
+Also finishes the footprint-geometry feature from the prior session: wires
+geometry_mode (auto/point_only/footprint_only) through GET /logs/{id}/map
+as a query param, with a 400 on an invalid value instead of a 500.
+---
+ backend/src/backend/db.py                    |  15 +-
+ backend/src/backend/db_postgis.py            |  43 ++-
+ backend/src/backend/main.py                  |  89 +++++-
+ backend/src/backend/pipeline_runner.py       |   9 +-
+ backend/src/backend/schemas.py               |   3 +
+ backend/src/geolocation/csv_engine.py        | 304 +++++++++++++++++++
+ backend/src/geolocation/geojson_export.py    |  67 +++-
+ backend/src/geolocation/georeference.py      | 112 ++++++-
+ backend/tests/test_csv_geolocation_engine.py | 153 ++++++++++
+ backend/tests/test_footprint_geometry.py     | 137 +++++++++
+ 10 files changed, 902 insertions(+), 30 deletions(-)
+ create mode 100644 backend/src/geolocation/csv_engine.py
+ create mode 100644 backend/tests/test_csv_geolocation_engine.py
+ create mode 100644 backend/tests/test_footprint_geometry.py
+
+diff --git a/backend/src/backend/db.py b/backend/src/backend/db.py
+index 4d3a2cf..93f54b7 100644
+--- a/backend/src/backend/db.py
++++ b/backend/src/backend/db.py
+@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS detections (
+     geo_method TEXT,                   -- 'nav_fix' | 'placeholder'
+     depth_m REAL,                      -- water depth below surface, NULL unless the nav
+                                         -- sidecar/XTF actually carried one (never fabricated)
++    footprint_geojson TEXT,            -- JSON list of [lon, lat] pairs, the debris's 4-corner
++                                        -- real-world footprint polygon; NULL for placeholder
++                                        -- detections (see georeference.py's GeoResult.footprint)
+     vae_panel_dir TEXT,
+     created_at TEXT NOT NULL
+ );
+@@ -86,6 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
+ # TABLE, or every insert against it fails with "no column named depth_m".
+ _DETECTIONS_MIGRATIONS = [
+     ("depth_m", "REAL"),
++    ("footprint_geojson", "TEXT"),
+ ]
+ 
+ _LOG_MIGRATIONS = [
+@@ -207,15 +211,15 @@ def insert_detection(conn: sqlite3.Connection, det: dict[str, Any]) -> None:
+             id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
+             bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
+             confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
+-            lat, lon, geo_method, depth_m, vae_panel_dir, created_at
+-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++            lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at
++        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         (
+             det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
+             det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
+             *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
+             det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
+             det.get("lat"), det.get("lon"), det.get("geo_method"), det.get("depth_m"),
+-            det.get("vae_panel_dir"), det["created_at"],
++            det.get("footprint_geojson"), det.get("vae_panel_dir"), det["created_at"],
+         ),
+     )
+ 
+@@ -237,5 +241,10 @@ def list_detections(conn: sqlite3.Connection, log_id: str,
+                 d["confidence_breakdown"] = json.loads(d["confidence_breakdown"])
+             except (TypeError, json.JSONDecodeError):
+                 pass
++        if d.get("footprint_geojson"):
++            try:
++                d["footprint_geojson"] = json.loads(d["footprint_geojson"])
++            except (TypeError, json.JSONDecodeError):
++                pass
+         results.append(d)
+     return results
+diff --git a/backend/src/backend/db_postgis.py b/backend/src/backend/db_postgis.py
+index 579a77a..24a66f6 100644
+--- a/backend/src/backend/db_postgis.py
++++ b/backend/src/backend/db_postgis.py
+@@ -41,6 +41,11 @@ logger = get_logger(__name__)
+ DEFAULT_DSN = "postgresql://sonarsense:sonarsense@localhost:5432/sonarsense"
+ 
+ SCHEMA = """
++-- footprint_geojson / geom_footprint (added alongside lat/lon/geom, not
++-- instead of them -- see georeference.py's GeoResult.footprint): the
++-- debris's real-world 4-corner footprint polygon, not just its center
++-- point. geom_footprint is NULL under the exact same placeholder rule as
++-- geom (see _footprint_geom_expr below).
+ CREATE EXTENSION IF NOT EXISTS postgis;
+ 
+ CREATE TABLE IF NOT EXISTS logs (
+@@ -81,9 +86,11 @@ CREATE TABLE IF NOT EXISTS detections (
+     lon DOUBLE PRECISION,
+     geo_method TEXT,
+     depth_m DOUBLE PRECISION,
++    footprint_geojson JSONB,
+     vae_panel_dir TEXT,
+     created_at TEXT NOT NULL,
+-    geom geometry(Point, 4326)
++    geom geometry(Point, 4326),
++    geom_footprint geometry(Polygon, 4326)
+ );
+ 
+ CREATE TABLE IF NOT EXISTS frame_analyses (
+@@ -99,9 +106,12 @@ CREATE TABLE IF NOT EXISTS frame_analyses (
+ CREATE INDEX IF NOT EXISTS idx_detections_log_id ON detections(log_id);
+ CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
+ CREATE INDEX IF NOT EXISTS idx_detections_geom ON detections USING GIST(geom);
++CREATE INDEX IF NOT EXISTS idx_detections_geom_footprint ON detections USING GIST(geom_footprint);
+ ALTER TABLE logs ADD COLUMN IF NOT EXISTS yolo_confidence_threshold DOUBLE PRECISION;
+ ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_inference_ms DOUBLE PRECISION;
+ ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_frames INTEGER NOT NULL DEFAULT 0;
++ALTER TABLE detections ADD COLUMN IF NOT EXISTS footprint_geojson JSONB;
++ALTER TABLE detections ADD COLUMN IF NOT EXISTS geom_footprint geometry(Polygon, 4326);
+ """
+ 
+ # Everything in SCHEMA after the `CREATE EXTENSION` line -- used as a
+@@ -166,6 +176,18 @@ def _geom_expr(lat: Optional[float], lon: Optional[float]) -> Optional[str]:
+     return "ST_SetSRID(ST_MakePoint(%s, %s), 4326)"
+ 
+ 
++def _footprint_geom_expr(footprint_ring: Optional[list]) -> tuple[Optional[str], Optional[str]]:
++    """Builds geom_footprint from a [[lon, lat], ...] ring (see
++    georeference.py's GeoResult.footprint / pipeline_runner.py's
++    footprint_geojson). Returns (sql_fragment, geojson_param) -- both None
++    when there's no footprint, same placeholder discipline as _geom_expr:
++    no shape gets fabricated for a detection with no nav fix."""
++    if not footprint_ring:
++        return None, None
++    polygon_geojson = json.dumps({"type": "Polygon", "coordinates": [footprint_ring]})
++    return "ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)", polygon_geojson
++
++
+ # --------------------------------------------------------------------------
+ # logs
+ # --------------------------------------------------------------------------
+@@ -259,21 +281,30 @@ def insert_detection(conn, det: dict[str, Any]) -> None:
+     geom_sql = geom_expr if geom_expr else "NULL"
+     geom_params = (lon, lat) if geom_expr else ()
+ 
++    footprint_ring = det.get("footprint_geojson")
++    if isinstance(footprint_ring, str):
++        footprint_ring = json.loads(footprint_ring)
++    footprint_col = psycopg2.extras.Json(footprint_ring) if footprint_ring else None
++    footprint_geom_expr, footprint_geom_param = _footprint_geom_expr(footprint_ring)
++    footprint_geom_sql = footprint_geom_expr if footprint_geom_expr else "NULL"
++    footprint_geom_params = (footprint_geom_param,) if footprint_geom_expr else ()
++
+     with conn.cursor() as cur:
+         cur.execute(
+             f"""INSERT INTO detections (
+                 id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
+                 bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
+                 confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
+-                lat, lon, geo_method, depth_m, vae_panel_dir, created_at, geom
+-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {geom_sql})""",
++                lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at, geom, geom_footprint
++            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
++                      {geom_sql}, {footprint_geom_sql})""",
+             (
+                 det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
+                 det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
+                 *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
+                 det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
+-                lat, lon, det.get("geo_method"), det.get("depth_m"),
+-                det.get("vae_panel_dir"), det["created_at"], *geom_params,
++                lat, lon, det.get("geo_method"), det.get("depth_m"), footprint_col,
++                det.get("vae_panel_dir"), det["created_at"], *geom_params, *footprint_geom_params,
+             ),
+         )
+ 
+@@ -292,6 +323,7 @@ def list_detections(conn, log_id: str, min_confidence: Optional[float] = None) -
+     for r in rows:
+         d = dict(r)
+         d.pop("geom", None)  # internal-only; lat/lon already carry the same info for callers
++        d.pop("geom_footprint", None)  # internal-only; footprint_geojson already carries the same ring for callers
+         # confidence_breakdown comes back already-deserialized (JSONB -> dict via psycopg2)
+         results.append(d)
+     return results
+@@ -322,5 +354,6 @@ def detections_within_radius(conn, lat: float, lon: float, radius_m: float,
+     for r in rows:
+         d = dict(r)
+         d.pop("geom", None)
++        d.pop("geom_footprint", None)
+         results.append(d)
+     return results
+diff --git a/backend/src/backend/main.py b/backend/src/backend/main.py
+index 16a9414..fa2a44a 100644
+--- a/backend/src/backend/main.py
++++ b/backend/src/backend/main.py
+@@ -8,6 +8,8 @@ Endpoints (all under this one app):
+   POST   /logs/upload_dir                      upload a whole folder of frames (+ optional nav
+                                                  sidecar) as one multipart request, starts processing
+   POST   /logs/upload_zip                      upload images + metadata CSV as one ZIP archive
++  POST   /logs/geolocate_csv                    geolocate detections.csv (from an external/offline
++                                                 detector) against nav.csv -- no image/YOLO/VAE stage
+   POST   /logs/ingest_local                    process a folder that already exists on the SERVER's
+                                                  own filesystem -- no upload at all (dev/local use)
+   GET    /health                                service + XTF-reader status
+@@ -17,7 +19,8 @@ Endpoints (all under this one app):
+   GET    /logs/{log_id}/detections              detection records (the "records" area)
+   GET    /logs/{log_id}/stats                   aggregate YOLO stats ("model output stats" area)
+   GET    /logs/{log_id}/vae_stats               VAE anomaly-error stats ("VAE stats" area)
+-  GET    /logs/{log_id}/map                     GeoJSON of geolocated detections ("GPS map" area)
++  GET    /logs/{log_id}/map                     GeoJSON of geolocated detections ("GPS map" area);
++                                                 ?geometry_mode=auto|point_only|footprint_only
+   GET    /logs/{log_id}/report.json             downloadable JSON report
+   GET    /logs/{log_id}/report.csv              downloadable CSV report
+   GET    /logs/{log_id}/report.geojson          downloadable GeoJSON (same content as /map)
+@@ -46,7 +49,8 @@ from fastapi.middleware.cors import CORSMiddleware
+ from src.backend import db_backend as db
+ from src.backend.api_routes import router as frontend_api_router
+ from src.backend.archive_ingestion import extract_survey_zip
+-from src.backend.pipeline_runner import process_log
++from src.backend.pipeline_runner import _write_reports, process_log
++from src.geolocation.csv_engine import run_csv_pipeline_to_detections
+ from src.backend.model_release import model_metadata, validate_present_checkpoints
+ from src.backend.schemas import Detection, LocalIngestRequest, LogSummary, ModelOutputStats, UploadResponse, VaeStats
+ from src.geolocation.geojson_export import build_geojson, write_geojson
+@@ -347,6 +351,73 @@ async def upload_log_zip(
+     )
+ 
+ 
++@app.post("/logs/geolocate_csv", response_model=UploadResponse)
++async def geolocate_csv(
++    detections_csv: UploadFile = File(..., description="Detections CSV: ping_id,pixel_x,bbox_w,bbox_h,class,confidence "
++                                                          "(column-name aliases width/w, height/h also accepted)."),
++    nav_csv: UploadFile = File(..., description="Nav CSV: ping_id,lat,lon,heading,altitude_m,depth_m,timestamp "
++                                                  "(ship_lat/ship_lon/heading_deg/altitude/depth/timestamp_utc "
++                                                  "aliases also accepted)."),
++    image_width: int = 2000,
++    range_per_pixel: float = DEFAULT_PIXELS_TO_METERS,
++) -> UploadResponse:
++    """Second ingestion path alongside /logs/upload et al.: geolocates
++    detections that were already produced by an EXTERNAL/offline detector
++    (a Roboflow-hosted model, a prior batch run, ...) rather than running
++    YOLO/VAE here. See src/geolocation/csv_engine.py's module docstring for
++    the full math and its one intentional fix (object depth = nav depth +
++    altitude) versus the standalone script this was adapted from.
++
++    Synchronous (no background thread/WebSocket progress) -- this is pure
++    arithmetic over two CSVs, not an ML pipeline, so it's fast enough to
++    finish within the request. Results are written into the SAME
++    `detections` table as image-pipeline logs (source_format=
++    "csv_detections"), so they show up in GET /logs/{id}/map,
++    /logs/{id}/detections, and the downloadable reports identically to
++    pipeline-produced detections -- one unified store regardless of source.
++    A ping_id in detections_csv with no matching row in nav_csv is skipped
++    (not stored as a placeholder), same join-and-skip behavior as the
++    original standalone script; the response's `message` reports how many
++    were skipped."""
++    log_id = str(uuid.uuid4())
++    log_dir = UPLOAD_DIR / log_id
++    log_dir.mkdir(parents=True, exist_ok=True)
++
++    detections_path = log_dir / (detections_csv.filename or "detections.csv")
++    with open(detections_path, "wb") as f:
++        shutil.copyfileobj(detections_csv.file, f)
++    nav_path = log_dir / (nav_csv.filename or "nav.csv")
++    with open(nav_path, "wb") as f:
++        shutil.copyfileobj(nav_csv.file, f)
++
++    created_at = _now_iso()
++    with db.get_connection(DB_PATH) as conn:
++        db.create_log(conn, log_id, detections_csv.filename or "detections.csv", "csv_detections", created_at,
++                       pixels_to_meters=range_per_pixel)
++
++    try:
++        rows, n_skipped = run_csv_pipeline_to_detections(
++            detections_path, nav_path, image_width, range_per_pixel, log_id, created_at,
++        )
++        with db.get_connection(DB_PATH) as conn:
++            for row in rows:
++                db.insert_detection(conn, row)
++            db.update_log_counts(conn, log_id, len(rows), len(rows))
++            db.update_log_status(conn, log_id, "done", completed_at=_now_iso())
++
++        out_dir = OUTPUT_DIR / log_id
++        _write_reports(DB_PATH, log_id, out_dir)
++    except Exception as exc:
++        with db.get_connection(DB_PATH) as conn:
++            db.update_log_status(conn, log_id, "error", error_message=str(exc), completed_at=_now_iso())
++        raise HTTPException(422, f"CSV geolocation failed: {exc}") from exc
++
++    message = f"Geolocated {len(rows)} detection(s)."
++    if n_skipped:
++        message += f" Skipped {n_skipped} with no matching nav row."
++    return UploadResponse(log_id=log_id, status="done", message=message)
++
++
+ @app.post("/logs/ingest_local", response_model=UploadResponse)
+ def ingest_local_directory(req: LocalIngestRequest) -> UploadResponse:
+     """Process a folder that ALREADY exists on the SERVER's own filesystem --
+@@ -524,18 +595,26 @@ def get_vae_output_file(log_id: str, frame_record_id: str, filename: str) -> Fil
+ # --------------------------------------------------------------------------
+ 
+ @app.get("/logs/{log_id}/map")
+-def get_map_geojson(log_id: str) -> dict:
++def get_map_geojson(log_id: str, geometry_mode: str = "auto") -> dict:
+     """GeoJSON FeatureCollection -- only detections with a real nav-derived
+     location (geo_method == 'nav_fix'). Detections with no nav data are
+     excluded here (not plotted as fake points); use /detections for those.
+     Built by the geolocation engine's own GeoJSON output method (src.
+     geolocation.geojson_export.build_geojson) -- the same function
+     pipeline_runner.py uses to write report.geojson to disk, so this live
+-    endpoint and that downloadable file are always identical in shape."""
++    endpoint and that downloadable file are always identical in shape.
++
++    `geometry_mode` (query param, default "auto") is passed straight
++    through to build_geojson -- see geojson_export.py's GEOMETRY_MODES for
++    "auto" | "point_only" | "footprint_only". An unrecognized value is a
++    client error (400), not a silent fallback to "auto"."""
+     _require_log(log_id)
+     with db.get_connection(DB_PATH) as conn:
+         detections = db.list_detections(conn, log_id)
+-    return build_geojson(detections, only_geolocated=True)
++    try:
++        return build_geojson(detections, only_geolocated=True, geometry_mode=geometry_mode)
++    except ValueError as e:
++        raise HTTPException(400, str(e))
+ 
+ 
+ # --------------------------------------------------------------------------
+diff --git a/backend/src/backend/pipeline_runner.py b/backend/src/backend/pipeline_runner.py
+index d753f4f..9204f3c 100644
+--- a/backend/src/backend/pipeline_runner.py
++++ b/backend/src/backend/pipeline_runner.py
+@@ -251,8 +251,8 @@ def _process_log_unlocked(
+                     )
+                     nav_fix = _nav_fix_for_detection(record, box["xyxy"], final.shape[:2])
+                     geo = geolocate_detection(
+-                        xyxy=box["xyxy"], image_width_px=final.shape[1], nav_fix=nav_fix,
+-                        pixels_to_meters=pixels_to_meters, port_is_left=port_is_left,
++                        xyxy=box["xyxy"], image_width_px=final.shape[1], image_height_px=final.shape[0],
++                        nav_fix=nav_fix, pixels_to_meters=pixels_to_meters, port_is_left=port_is_left,
+                     )
+                     det = {
+                         "id": str(uuid.uuid4()),
+@@ -273,6 +273,11 @@ def _process_log_unlocked(
+                         "lon": geo.lon if geo.method == "nav_fix" else None,
+                         "geo_method": geo.method,
+                         "depth_m": geo.depth_m,  # None unless the nav sidecar/XTF actually carried one
++                        # Debris footprint (4-corner polygon, not just the center point above) --
++                        # None whenever geo.footprint is None (placeholder detections, same rule as lat/lon).
++                        # Stored pre-flipped to GeoJSON's [lon, lat] coordinate order so
++                        # geojson_export.py can drop it straight into a Polygon with no reformatting.
++                        "footprint_geojson": json.dumps([[lon, lat] for lat, lon in geo.footprint]) if geo.footprint else None,
+                         "vae_panel_dir": fr["vae_panel_dir"],
+                         "created_at": _now_iso(),
+                     }
+diff --git a/backend/src/backend/schemas.py b/backend/src/backend/schemas.py
+index 12672f8..94e7e21 100644
+--- a/backend/src/backend/schemas.py
++++ b/backend/src/backend/schemas.py
+@@ -64,6 +64,9 @@ class Detection(BaseModel):
+     geo_method: Optional[str] = None
+     depth_m: Optional[float] = None  # water depth below surface, from the nav fix if it carried one
+     # (see src/geolocation/nav.py's NavFix.depth_m) -- null, never fabricated, when absent.
++    footprint_geojson: Optional[list[list[float]]] = None  # [[lon, lat], ...] closed ring -- the
++    # debris's real-world 4-corner footprint (see src/geolocation/georeference.py's
++    # GeoResult.footprint), null under the exact same rule as lat/lon: no nav fix, no shape.
+     vae_panel_dir: Optional[str] = None
+     created_at: str
+ 
+diff --git a/backend/src/geolocation/csv_engine.py b/backend/src/geolocation/csv_engine.py
+new file mode 100644
+index 0000000..b7e3804
+--- /dev/null
++++ b/backend/src/geolocation/csv_engine.py
+@@ -0,0 +1,304 @@
++"""CSV-based geolocation engine -- a second ingestion path alongside the
++main image+XTF pipeline (pipeline_runner.py + georeference.py).
++
++That pipeline runs YOLO/VAE against raw sonar frames itself. This module
++instead geolocates detections that ALREADY EXIST as a CSV -- produced by an
++external/offline detector (a Roboflow-hosted model, another team's
++detector, a prior batch run, etc.) -- joined against a nav CSV keyed by
++`ping_id`. It was originally a standalone CLI script; that CLI is preserved
++below (`run_pipeline()` / `main()`) for anyone still using it that way, but
++the function this backend actually calls is `run_csv_pipeline_to_detections()`,
++which returns rows shaped for `src.backend.db.insert_detection()` so CSV-
++sourced detections land in the SAME `detections` table as pipeline-produced
++ones -- one unified store regardless of source. See `main.py`'s
++`POST /logs/geolocate_csv` for the endpoint that wires this in.
++
++INPUT FORMAT:
++  detections.csv columns: ping_id, pixel_x, bbox_w (or width/w),
++    bbox_h (or height/h), class, confidence
++  nav.csv columns: ping_id, lat (or ship_lat), lon (or ship_lon),
++    heading (or heading_deg), altitude_m (or altitude),
++    depth_m (or depth), timestamp (or timestamp_utc)
++
++MATH (unchanged from the original script -- see geolocate_csv_detection):
++  1. slant range = |pixel_x - image_center| * range_per_pixel_m
++  2. ground range = sqrt(slant_range^2 - altitude^2), clamped to 0 when the
++     detection is close enough to nadir that this would go negative
++  3. side = "port" (pixel left of center) or "starboard" (right of center);
++     bearing = heading -/+ 90 degrees respectively
++  4. east/north offset = ground_range * sin/cos(bearing)
++  5. flat-earth offset applied to the nav fix's own lat/lon (same
++     equirectangular approximation as georeference.py's offset_latlon --
++     accurate to a tiny fraction of a mm at these distances)
++
++ONE INTENTIONAL FIX vs the originally uploaded script: that script computed
++`depth_m` as just the nav fix's own depth, with no altitude correction. The
++detected object physically rests on/near the seafloor, which is
++`altitude_m` BELOW the vehicle -- so the object's depth is
++`nav_depth + altitude`, not the vehicle's own depth. Fixed here
++(`object_depth_m` in `geolocate_csv_detection`). If altitude is missing/0
++for a nav row, this degrades gracefully to the vehicle depth alone rather
++than guessing an altitude that isn't there.
++
++WHAT THIS MODULE DELIBERATELY DOES NOT DO (unlike georeference.py):
++  - No placeholder discipline for missing nav: a ping_id with no matching
++    nav row is simply skipped (see run_pipeline/run_csv_pipeline_to_detections),
++    not stored as a placeholder detection. There is no "nav row present but
++    some fields blank" case in practice for this CSV format the way there
++    is for optional XTF/sidecar fields, so this hasn't come up -- flagged
++    here in case a future caller feeds genuinely partial nav data.
++  - No footprint polygon (georeference.py's 4-corner footprint needs a
++    bounding-box ROW/column pair; this CSV format only carries pixel_x, not
++    a pixel_y, so there's no way to place the box vertically in the source
++    image). `footprint_geojson` is always None for these detections.
++"""
++
++from __future__ import annotations
++
++import csv
++import json
++import math
++import uuid
++from pathlib import Path
++from typing import Any, Optional
++
++EARTH_RADIUS_M = 6378137.0  # WGS84 -- same constant georeference.py uses
++
++
++def offset_to_latlon(lat: float, lon: float, east_m: float, north_m: float) -> tuple[float, float]:
++    """Flat-earth/equirectangular offset -- same approximation as
++    georeference.py's offset_latlon, accurate to a tiny fraction of a
++    millimeter at these (tens-of-meters) detection-offset distances."""
++    d_lat = north_m / EARTH_RADIUS_M
++    d_lon = east_m / (EARTH_RADIUS_M * math.cos(math.pi * lat / 180.0))
++    return lat + math.degrees(d_lat), lon + math.degrees(d_lon)
++
++
++def geolocate_csv_detection(det: dict, nav: dict, range_per_pixel_m: float, image_width: int) -> dict:
++    """Runs one detection through the full slant-range -> ground-range ->
++    ENU-offset -> lat/lon chain (see module docstring for the math and the
++    one intentional depth fix). Returns a plain dict of derived values --
++    NOT yet shaped for the `detections` table; see
++    `_to_detection_row()` for that."""
++    lat = float(nav.get("lat", nav.get("ship_lat", 0.0)) or 0.0)
++    lon = float(nav.get("lon", nav.get("ship_lon", 0.0)) or 0.0)
++    heading = float(nav.get("heading", nav.get("heading_deg", 0.0)) or 0.0)
++    altitude_m = float(nav.get("altitude_m", nav.get("altitude", 0.0)) or 0.0)
++    depth_m = float(nav.get("depth_m", nav.get("depth", 0.0)) or 0.0)
++    timestamp = nav.get("timestamp", nav.get("timestamp_utc", None))
++
++    pixel_x = float(det["pixel_x"])
++    bbox_w_pixels = float(det.get("bbox_w", det.get("width", det.get("w", 0.0))) or 0.0)
++    bbox_h_pixels = float(det.get("bbox_h", det.get("height", det.get("h", 0.0))) or 0.0)
++
++    center_x = image_width / 2.0
++    pixels_from_center = abs(pixel_x - center_x)
++    slant_range_m = pixels_from_center * range_per_pixel_m
++
++    if slant_range_m > altitude_m:
++        ground_range_m = math.sqrt(slant_range_m ** 2 - altitude_m ** 2)
++    else:
++        ground_range_m = 0.0
++
++    if pixel_x < center_x:
++        side = "port"
++        bearing_deg = heading - 90.0
++    else:
++        side = "starboard"
++        bearing_deg = heading + 90.0
++
++    bearing_rad = math.radians(bearing_deg)
++    east_m = ground_range_m * math.sin(bearing_rad)
++    north_m = ground_range_m * math.cos(bearing_rad)
++
++    obj_lat, obj_lon = offset_to_latlon(lat, lon, east_m, north_m)
++
++    width_m = round(bbox_w_pixels * range_per_pixel_m, 2)
++    length_m = round(bbox_h_pixels * range_per_pixel_m, 2)
++
++    # FIX (see module docstring): object depth = vehicle depth + altitude,
++    # not the vehicle's own depth alone.
++    object_depth_m = round(depth_m + altitude_m, 2)
++
++    return {
++        "ping_id": str(nav.get("ping_id", det.get("ping_id", ""))),
++        "class_name": det.get("class", "unknown"),
++        "confidence": float(det.get("confidence", 0.0) or 0.0),
++        "lat": round(obj_lat, 7),
++        "lon": round(obj_lon, 7),
++        "depth_m": object_depth_m,
++        "length_m": length_m,
++        "width_m": width_m,
++        "side": side,
++        "ground_range_m": round(ground_range_m, 2),
++        "timestamp": timestamp,
++        "pixel_x": pixel_x,
++        "bbox_w_px": bbox_w_pixels,
++        "bbox_h_px": bbox_h_pixels,
++    }
++
++
++def _load_csv_rows(path: str | Path) -> list[dict]:
++    with open(path, newline="", encoding="utf-8-sig") as f:
++        return list(csv.DictReader(f))
++
++
++def load_nav_csv(path: str | Path) -> dict[str, dict]:
++    """ping_id -> nav row, for O(1) join lookups."""
++    return {str(row["ping_id"]): row for row in _load_csv_rows(path)}
++
++
++def _to_detection_row(geo: dict, log_id: str, frame_index: int, created_at: str) -> dict:
++    """Shapes one geolocate_csv_detection() result into a dict matching
++    `src.backend.db.insert_detection()`'s expected keys (same shape
++    pipeline_runner.py builds for image-pipeline detections) -- this is
++    what makes CSV-sourced detections show up in GET /logs/{id}/detections,
++    /map, and every other endpoint identically to pipeline-produced ones.
++
++    bbox_x1/x2 are reconstructed from pixel_x +/- half the box width so the
++    frontend's existing bbox-based dimension math (bbox * pixels_to_meters)
++    reproduces the same length/width this module already computed
++    independently. There's no pixel_y in this CSV format at all (see module
++    docstring), so bbox_y1/y2 are placed at an arbitrary but harmless
++    [0, bbox_h] -- vertical position in the source frame is simply unknown
++    here, unlike the image pipeline where it's real."""
++    half_w = geo["bbox_w_px"] / 2.0
++    from src.confidence.scoring import score_detection  # local import: avoids a hard
++    # dependency on the confidence module for callers that only want the geolocation math
++    conf_result = score_detection(
++        yolo_conf=geo["confidence"], class_name=geo["class_name"],
++        xyxy=[geo["pixel_x"] - half_w, 0.0, geo["pixel_x"] + half_w, geo["bbox_h_px"]],
++        gray_image=None,  # no source frame available for a CSV-only detection
++        vae_whole_image_percentile=None,  # no VAE stage ran on this detection
++    )
++    return {
++        "id": str(uuid.uuid4()),
++        "log_id": log_id,
++        "frame_index": frame_index,
++        "frame_record_id": geo["ping_id"],
++        "frame_image_path": None,
++        "class_name": geo["class_name"],
++        "yolo_conf": geo["confidence"],
++        "bbox": [geo["pixel_x"] - half_w, 0.0, geo["pixel_x"] + half_w, geo["bbox_h_px"]],
++        "confidence_score": conf_result.score,
++        "confidence_label": conf_result.label,
++        "confidence_breakdown": conf_result.breakdown,
++        "vae_box_error": None,
++        "vae_whole_image_error": None,
++        "vae_whole_image_percentile": None,
++        "lat": geo["lat"],
++        "lon": geo["lon"],
++        "geo_method": "nav_fix",  # every row here had a matched nav fix by construction --
++        # rows with no nav match are skipped before this point, see run_csv_pipeline_to_detections
++        "depth_m": geo["depth_m"],
++        "footprint_geojson": None,  # no pixel_y in this format -- see module docstring
++        "vae_panel_dir": None,
++        "created_at": created_at,
++    }
++
++
++def run_csv_pipeline_to_detections(
++    detections_csv: str | Path, nav_csv: str | Path, image_width: int, range_per_pixel_m: float,
++    log_id: str, created_at: str,
++) -> tuple[list[dict], int]:
++    """The backend-facing entry point: reads both CSVs, joins on ping_id,
++    geolocates every matched detection, and returns
++    (detection_rows_ready_for_db.insert_detection, n_skipped_for_no_nav_match).
++    Mirrors run_pipeline()'s join/skip behavior below exactly, just
++    returning DB-shaped rows instead of GeoJSON Features."""
++    nav_by_ping = load_nav_csv(nav_csv)
++    rows: list[dict] = []
++    skipped = 0
++    for frame_index, det in enumerate(_load_csv_rows(detections_csv)):
++        ping_id = str(det["ping_id"])
++        nav = nav_by_ping.get(ping_id)
++        if nav is None:
++            skipped += 1
++            continue
++        geo = geolocate_csv_detection(det, nav, range_per_pixel_m, image_width)
++        rows.append(_to_detection_row(geo, log_id, frame_index, created_at))
++    return rows, skipped
++
++
++# --------------------------------------------------------------------------
++# Original standalone-CLI surface, preserved for parity with the script this
++# module was adapted from (`geolocation_engine.py`) -- same behavior, same
++# output files, with the one depth fix from the module docstring applied.
++# --------------------------------------------------------------------------
++
++def build_geojson_feature(geo: dict) -> dict:
++    return {
++        "type": "Feature",
++        "geometry": {"type": "Point", "coordinates": [geo["lon"], geo["lat"]]},
++        "properties": {
++            "ping_id": geo["ping_id"],
++            "class": geo["class_name"],
++            "confidence": geo["confidence"],
++            "depth_m": geo["depth_m"],
++            "length_m": geo["length_m"],
++            "width_m": geo["width_m"],
++            "side": geo["side"],
++            "ground_range_m": geo["ground_range_m"],
++            "timestamp": geo["timestamp"],
++        },
++    }
++
++
++def run_pipeline(detections_file, nav_file, image_width, range_per_pixel) -> list[dict]:
++    """CLI-compatible entry point: reads the CSVs, matches pings, and
++    returns a list of GeoJSON Features (same contract as the original
++    script's run_pipeline())."""
++    print("Loading navigation metadata...")
++    nav_dict = load_nav_csv(nav_file)
++
++    print("Processing AI detections...")
++    results = []
++    for det in _load_csv_rows(detections_file):
++        ping_id = str(det["ping_id"])
++        nav = nav_dict.get(ping_id)
++        if nav is None:
++            print(f"Warning: No navigation data found for ping_id {ping_id}")
++            continue
++        geo = geolocate_csv_detection(det, nav, range_per_pixel, image_width)
++        results.append(build_geojson_feature(geo))
++    return results
++
++
++def main() -> None:
++    import argparse
++
++    parser = argparse.ArgumentParser(description="SonarSense Geolocation Engine")
++    parser.add_argument("--detections", required=True, help="Path to detections CSV")
++    parser.add_argument("--nav", required=True, help="Path to navigation/telemetry CSV")
++    parser.add_argument("--image-width", type=int, required=True, help="Total width of sonar image in pixels")
++    parser.add_argument("--range-per-pixel", type=float, required=True, help="Resolution in meters per pixel")
++    parser.add_argument("--output", default="detections.geojson", help="Output GeoJSON file path")
++    parser.add_argument("--load-postgis", action="store_true", help="Also write a .sql load file")
++    parser.add_argument("--db-url", help="(unused by --load-postgis, which only writes a SQL dump file -- "
++                                          "kept for CLI compatibility with the original script)")
++    args = parser.parse_args()
++
++    features = run_pipeline(args.detections, args.nav, args.image_width, args.range_per_pixel)
++    geojson_output = {"type": "FeatureCollection", "features": features}
++
++    with open(args.output, "w", encoding="utf-8") as f:
++        json.dump(geojson_output, f, indent=2)
++
++    print(f"Successfully geolocated {len(features)} objects.")
++    print(f"Output saved to {args.output}")
++
++    if args.load_postgis:
++        sql_filename = args.output.replace(".geojson", ".sql")
++        with open(sql_filename, "w") as f:
++            f.write("CREATE TABLE IF NOT EXISTS marine_debris "
++                     "(id SERIAL PRIMARY KEY, geom GEOMETRY(Point, 4326), properties JSONB);\n")
++            for feature in features:
++                geom = json.dumps(feature["geometry"])
++                props = json.dumps(feature["properties"])
++                f.write(f"INSERT INTO marine_debris (geom, properties) VALUES "
++                        f"(ST_GeomFromGeoJSON('{geom}'), '{props}'::jsonb);\n")
++        print(f"Generated PostGIS SQL file: {sql_filename}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backend/src/geolocation/geojson_export.py b/backend/src/geolocation/geojson_export.py
+index 9d140b8..4274d81 100644
+--- a/backend/src/geolocation/geojson_export.py
++++ b/backend/src/geolocation/geojson_export.py
+@@ -18,6 +18,27 @@ are included by default -- a detection with no nav data resolves to a
+ misrepresent it as a real position off the coast of Africa. Pass
+ only_geolocated=False to include everything anyway (e.g. for a debug export
+ that also wants to see what got excluded and why).
++
++GEOMETRY: each Feature carries the debris's center POINT (as before) and,
++when `footprint_geojson` is present on the detection (see georeference.py's
++GeoResult.footprint / pipeline_runner.py), its 4-corner footprint POLYGON
++too -- the actual real-world shape of the object, not just a dot.
++`geometry_mode` controls how the two combine into the one `geometry` a
++GeoJSON Feature is allowed to have (RFC 7946 -- one geometry per Feature):
++
++  "auto"           (default) GeometryCollection [Point, Polygon] when a
++                    footprint exists, else plain Point. This is the
++                    functional change over the old behavior.
++  "point_only"     always plain Point, footprint ignored -- the exact
++                    output this module produced before footprints existed,
++                    for a consumer that can't handle GeometryCollection.
++  "footprint_only" Polygon when available, else falls back to Point (never
++                    drops a detection just because it predates footprints).
++
++Either way, `properties.has_footprint` says which shape is actually present
++without needing to inspect `geometry.type`, and `properties.footprint`
++carries the raw [[lon, lat], ...] ring directly too, for a consumer that
++would rather read coordinates from properties than parse GeometryCollection.
+ """
+ 
+ from __future__ import annotations
+@@ -26,15 +47,41 @@ import json
+ from pathlib import Path
+ from typing import Any
+ 
++GEOMETRY_MODES = ("auto", "point_only", "footprint_only")
++
++
++def _footprint_ring(d: dict[str, Any]) -> list | None:
++    ring = d.get("footprint_geojson")
++    if isinstance(ring, str):
++        try:
++            ring = json.loads(ring)
++        except json.JSONDecodeError:
++            return None
++    return ring or None
+ 
+-def build_geojson(detections: list[dict[str, Any]], only_geolocated: bool = True) -> dict[str, Any]:
++
++def _feature_geometry(lon: float, lat: float, ring: list | None, geometry_mode: str) -> dict[str, Any]:
++    point = {"type": "Point", "coordinates": [lon, lat]}
++    if geometry_mode == "point_only" or not ring:
++        return point
++    polygon = {"type": "Polygon", "coordinates": [ring]}
++    if geometry_mode == "footprint_only":
++        return polygon
++    return {"type": "GeometryCollection", "geometries": [point, polygon]}  # "auto"
++
++
++def build_geojson(detections: list[dict[str, Any]], only_geolocated: bool = True,
++                   geometry_mode: str = "auto") -> dict[str, Any]:
+     """Builds an RFC 7946 FeatureCollection from a list of detection dicts
+     (as returned by src.backend.db.list_detections). Each qualifying
+-    detection becomes one Point Feature; every value the "detection records"
+-    area already shows is carried into `properties` too, so a GIS tool
+-    (QGIS, geojson.io, ...) opening this file has the full picture without
+-    a second round-trip to the API.
++    detection becomes one Feature (see module docstring for `geometry_mode`);
++    every value the "detection records" area already shows is carried into
++    `properties` too, so a GIS tool (QGIS, geojson.io, ...) opening this
++    file has the full picture without a second round-trip to the API.
+     """
++    if geometry_mode not in GEOMETRY_MODES:
++        raise ValueError(f"geometry_mode must be one of {GEOMETRY_MODES}, got {geometry_mode!r}")
++
+     features = []
+     for d in detections:
+         has_location = d.get("lat") is not None and d.get("lon") is not None
+@@ -44,9 +91,10 @@ def build_geojson(detections: list[dict[str, Any]], only_geolocated: bool = True
+         if not has_location:
+             continue  # can't emit a Point with no coordinates regardless of only_geolocated
+ 
++        ring = _footprint_ring(d)
+         features.append({
+             "type": "Feature",
+-            "geometry": {"type": "Point", "coordinates": [d["lon"], d["lat"]]},
++            "geometry": _feature_geometry(d["lon"], d["lat"], ring, geometry_mode),
+             "properties": {
+                 "detection_id": d.get("id"),
+                 "log_id": d.get("log_id"),
+@@ -60,17 +108,20 @@ def build_geojson(detections: list[dict[str, Any]], only_geolocated: bool = True
+                 "vae_whole_image_percentile": d.get("vae_whole_image_percentile"),
+                 "geo_method": d.get("geo_method"),
+                 "created_at": d.get("created_at"),
++                "has_footprint": ring is not None,
++                "footprint": ring,  # [[lon, lat], ...] closed ring, or None
+             },
+         })
+ 
+     return {"type": "FeatureCollection", "features": features}
+ 
+ 
+-def write_geojson(path: str | Path, detections: list[dict[str, Any]], only_geolocated: bool = True) -> dict[str, Any]:
++def write_geojson(path: str | Path, detections: list[dict[str, Any]], only_geolocated: bool = True,
++                   geometry_mode: str = "auto") -> dict[str, Any]:
+     """Builds the FeatureCollection and writes it to `path`. Returns the
+     dict that was written (handy for a caller that wants both the file AND
+     the in-memory value without re-parsing it)."""
+-    geojson = build_geojson(detections, only_geolocated=only_geolocated)
++    geojson = build_geojson(detections, only_geolocated=only_geolocated, geometry_mode=geometry_mode)
+     path = Path(path)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     with open(path, "w") as f:
+diff --git a/backend/src/geolocation/georeference.py b/backend/src/geolocation/georeference.py
+index f3596ef..a82f0b7 100644
+--- a/backend/src/geolocation/georeference.py
++++ b/backend/src/geolocation/georeference.py
+@@ -34,6 +34,35 @@ KNOWN SIMPLIFICATIONS (stated explicitly, not hidden):
+     image+sidecar path there is no way to know it without either the
+     sidecar specifying it or the user providing the sonar's configured
+     range setting -- there is no way to recover it from pixels alone.
++
++FOOTPRINT GEOMETRY (in addition to the existing center-point output):
++  `geolocate_detection` also projects all 4 bbox corners into lat/lon,
++  producing a small polygon -- the debris's actual real-world footprint,
++  not just a single point -- via `footprint_polygon_latlon`. This is
++  ADDITIVE: `GeoResult.lat`/`.lon`/`.method`/`.depth_m` are all unchanged,
++  every existing caller keeps working untouched, and the footprint is
++  simply `None` whenever there's no nav fix (same placeholder discipline
++  as the point).
++
++  Two more simplifications this introduces, on top of the ones above:
++  - The along-track axis (image rows, i.e. distance in the direction of
++    travel) is assumed to use the SAME ground resolution as the across-
++    track axis (`pixels_to_meters`) unless `pixels_to_meters_along_track`
++    is given explicitly. Nothing in this pipeline measures the two
++    separately today -- this is a square-pixel assumption, not a
++    calibrated fact, exactly like `pixels_to_meters` itself.
++  - Which end of the box (`y1` vs `y2`) is "ahead" of the vehicle depends
++    on this dataset/sensor's row-time ordering, which isn't recorded
++    anywhere upstream. Defaults to `along_track_sign=1` (higher row index
++    = further along track); flip it to -1 if a footprint comes out
++    mirrored front-to-back against known ground truth.
++  - The whole detection is treated as if it were geolocated from ONE nav
++    fix (the same one the center point already uses), not a separate fix
++    per corner row. For a single detection box (a small fraction of a
++    frame's height) this is a reasonable approximation; it is NOT
++    re-deriving a per-row fix the way XTF's per-ping nav_fixes_per_row
++    could in principle support -- that would be a further refinement, not
++    done here.
+ """
+ 
+ from __future__ import annotations
+@@ -57,6 +86,9 @@ class GeoResult:
+     # this module has no way to derive water depth from pixels/geometry, so it's simply
+     # relayed when the nav fix happened to carry one (see NavFix.depth_m), and stays None
+     # otherwise rather than being invented.
++    footprint: list[tuple[float, float]] | None = None  # [(lat, lon), ...] closed ring (4
++    # corners + first repeated), the debris's real-world footprint -- None for a placeholder
++    # result, same discipline as lat/lon=(0, 0) above: never fabricate a shape with no nav data.
+ 
+ 
+ def offset_latlon(lat: float, lon: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
+@@ -89,6 +121,55 @@ def box_center_across_track_px(xyxy: list[float], image_width_px: int) -> float:
+     return center_x - (image_width_px / 2.0)
+ 
+ 
++def _corner_latlon(nav_fix: NavFix, across_track_m: float, along_track_m: float,
++                    port_is_left: bool, offset_fn) -> tuple[float, float]:
++    """One bbox corner -> lat/lon. Composes two single-axis flat-earth
++    offsets from the nav fix: along-track first (parallel to heading), then
++    across-track (perpendicular to it) from that intermediate point. At SSS
++    swath-width distances this composition is equivalent to a single 2D
++    vector offset (see module docstring for the along/across simplifications
++    this relies on)."""
++    side_sign = 1 if port_is_left else -1
++    lat1, lon1 = offset_fn(nav_fix.lat, nav_fix.lon, nav_fix.heading_deg, along_track_m)
++    bearing_across = (nav_fix.heading_deg + 90.0 * side_sign) % 360.0
++    return offset_fn(lat1, lon1, bearing_across, across_track_m)
++
++
++def footprint_polygon_latlon(
++    xyxy: list[float],
++    image_width_px: int,
++    image_height_px: int,
++    nav_fix: NavFix,
++    pixels_to_meters: float,
++    pixels_to_meters_along_track: float | None = None,
++    port_is_left: bool = True,
++    along_track_sign: int = 1,
++    use_geodesic: bool = False,
++) -> list[tuple[float, float]]:
++    """Projects all 4 corners of a detection's bbox into lat/lon -- the
++    debris's real-world footprint, not just its center point. Returns a
++    closed ring: [corner0, corner1, corner2, corner3, corner0], ready to
++    drop straight into a GeoJSON Polygon's coordinates (after flipping each
++    (lat, lon) pair to GeoJSON's [lon, lat] order -- see geojson_export.py).
++    """
++    along_scale = pixels_to_meters_along_track if pixels_to_meters_along_track is not None else pixels_to_meters
++    x1, y1, x2, y2 = xyxy
++    center_x, center_y = image_width_px / 2.0, image_height_px / 2.0
++    corners_px = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]  # top-left, top-right, bottom-right, bottom-left
++
++    offset_fn = offset_latlon_geodesic if use_geodesic else offset_latlon
++    ring = []
++    for px, py in corners_px:
++        across_m = (px - center_x) * pixels_to_meters
++        along_m = (py - center_y) * along_scale * along_track_sign
++        try:
++            ring.append(_corner_latlon(nav_fix, across_m, along_m, port_is_left, offset_fn))
++        except ImportError:
++            ring.append(_corner_latlon(nav_fix, across_m, along_m, port_is_left, offset_latlon))
++    ring.append(ring[0])
++    return ring
++
++
+ def geolocate_detection(
+     xyxy: list[float],
+     image_width_px: int,
+@@ -96,17 +177,26 @@ def geolocate_detection(
+     pixels_to_meters: float,
+     port_is_left: bool = True,
+     use_geodesic: bool = False,
++    image_height_px: int | None = None,
++    pixels_to_meters_along_track: float | None = None,
++    along_track_sign: int = 1,
+ ) -> GeoResult:
+-    """Convert one detection box to a lat/lon.
++    """Convert one detection box to a lat/lon POINT (its center), plus --
++    when `image_height_px` is given -- a footprint POLYGON from all 4 bbox
++    corners (see `footprint_polygon_latlon`). `image_height_px` is optional
++    and keyword-only in effect (defaults to None) so every existing caller
++    that only ever wanted the point keeps working completely unchanged;
++    passing it is the only thing that turns footprint generation on.
+ 
+     If nav_fix is None (no nav data at all for this frame), returns a
+-    PLACEHOLDER result centered on (0, 0) rather than silently fabricating
+-    a plausible-looking coordinate -- callers/UI must check `.method` and
+-    render placeholder results distinctly (e.g. "location unknown"), never
+-    plot them on the map as if they were real.
++    PLACEHOLDER result centered on (0, 0) with footprint=None rather than
++    silently fabricating a plausible-looking coordinate or shape --
++    callers/UI must check `.method` and render placeholder results
++    distinctly (e.g. "location unknown"), never plot them on the map as if
++    they were real.
+     """
+     if nav_fix is None:
+-        return GeoResult(lat=0.0, lon=0.0, method="placeholder", across_track_m=0.0)
++        return GeoResult(lat=0.0, lon=0.0, method="placeholder", across_track_m=0.0, footprint=None)
+ 
+     offset_px = box_center_across_track_px(xyxy, image_width_px)
+     across_track_m = offset_px * pixels_to_meters
+@@ -120,5 +210,13 @@ def geolocate_detection(
+     except ImportError:
+         lat, lon = offset_latlon(nav_fix.lat, nav_fix.lon, bearing, across_track_m)
+ 
++    footprint = None
++    if image_height_px is not None:
++        footprint = footprint_polygon_latlon(
++            xyxy, image_width_px, image_height_px, nav_fix, pixels_to_meters,
++            pixels_to_meters_along_track=pixels_to_meters_along_track,
++            port_is_left=port_is_left, along_track_sign=along_track_sign, use_geodesic=use_geodesic,
++        )
++
+     return GeoResult(lat=lat, lon=lon, method="nav_fix", across_track_m=across_track_m,
+-                      depth_m=nav_fix.depth_m)
++                      depth_m=nav_fix.depth_m, footprint=footprint)
+diff --git a/backend/tests/test_csv_geolocation_engine.py b/backend/tests/test_csv_geolocation_engine.py
+new file mode 100644
+index 0000000..7f10e52
+--- /dev/null
++++ b/backend/tests/test_csv_geolocation_engine.py
+@@ -0,0 +1,153 @@
++import csv
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++from fastapi.testclient import TestClient
++
++from src.backend import db_backend as db
++from src.backend import main
++from src.geolocation.csv_engine import geolocate_csv_detection, run_csv_pipeline_to_detections
++
++
++class GeolocateCsvDetectionMathTests(unittest.TestCase):
++    """Same worked example used to explain this engine (pixel_x=1450,
++    bbox 80x30px, nav lat=19.0012/lon=72.8015/heading=45/altitude=8/depth=52,
++    image_width=2000, range_per_pixel=0.05) -- verifies the lat/lon/ground-range
++    math reproduces those numbers exactly, and that depth_m now includes
++    altitude (60.0 = 52 + 8), which the originally uploaded script did not do
++    (it would have returned 52.0)."""
++
++    def setUp(self):
++        self.det = {"pixel_x": 1450, "bbox_w": 80, "bbox_h": 30, "class": "pipe", "confidence": 0.9}
++        self.nav = {"lat": 19.0012, "lon": 72.8015, "heading": 45.0, "altitude_m": 8.0, "depth_m": 52.0,
++                    "ping_id": "P0001"}
++
++    def test_worked_example_matches_by_hand_computation(self):
++        geo = geolocate_csv_detection(self.det, self.nav, range_per_pixel_m=0.05, image_width=2000)
++        self.assertEqual(geo["side"], "starboard")
++        self.assertAlmostEqual(geo["ground_range_m"], 21.03, places=1)
++        self.assertAlmostEqual(geo["lat"], 19.0010664, places=6)
++        self.assertAlmostEqual(geo["lon"], 72.8016413, places=6)
++        self.assertAlmostEqual(geo["width_m"], 4.0, places=2)
++        self.assertAlmostEqual(geo["length_m"], 1.5, places=2)
++
++    def test_depth_fix_adds_altitude_to_nav_depth(self):
++        geo = geolocate_csv_detection(self.det, self.nav, range_per_pixel_m=0.05, image_width=2000)
++        self.assertAlmostEqual(geo["depth_m"], 60.0, places=2)  # 52.0 + 8.0, NOT 52.0
++
++    def test_port_side_when_pixel_left_of_center(self):
++        det = dict(self.det, pixel_x=550)
++        geo = geolocate_csv_detection(det, self.nav, range_per_pixel_m=0.05, image_width=2000)
++        self.assertEqual(geo["side"], "port")
++
++    def test_ground_range_clamped_to_zero_near_nadir(self):
++        det = dict(self.det, pixel_x=1005)  # 5px off center * 0.05 = 0.25m slant, well under altitude
++        geo = geolocate_csv_detection(det, self.nav, range_per_pixel_m=0.05, image_width=2000)
++        self.assertEqual(geo["ground_range_m"], 0.0)
++
++
++class RunCsvPipelineToDetectionsTests(unittest.TestCase):
++    """run_csv_pipeline_to_detections() is what main.py's /logs/geolocate_csv
++    endpoint calls -- checks the join/skip behavior and that every row is
++    shaped correctly for db.insert_detection()."""
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        tmp = Path(self._tmp.name)
++        self.detections_csv = tmp / "detections.csv"
++        self.nav_csv = tmp / "nav.csv"
++
++        with open(self.detections_csv, "w", newline="") as f:
++            w = csv.writer(f)
++            w.writerow(["ping_id", "pixel_x", "bbox_w", "bbox_h", "class", "confidence"])
++            w.writerow(["1000", "1450", "80", "30", "class_6", "0.95"])
++            w.writerow(["9999", "1450", "80", "30", "class_6", "0.95"])  # no matching nav row -> skipped
++
++        with open(self.nav_csv, "w", newline="") as f:
++            w = csv.writer(f)
++            w.writerow(["ping_id", "lat", "lon", "heading", "altitude_m", "depth_m", "timestamp"])
++            w.writerow(["1000", "19.0012", "72.8015", "45.0", "8.0", "52.0", "2026-09-10T10:00:00Z"])
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_unmatched_ping_id_is_skipped_not_stored(self):
++        rows, n_skipped = run_csv_pipeline_to_detections(
++            self.detections_csv, self.nav_csv, image_width=2000, range_per_pixel_m=0.05,
++            log_id="log-1", created_at="2026-01-01T00:00:00Z",
++        )
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(n_skipped, 1)
++
++    def test_row_is_shaped_for_insert_detection(self):
++        rows, _ = run_csv_pipeline_to_detections(
++            self.detections_csv, self.nav_csv, image_width=2000, range_per_pixel_m=0.05,
++            log_id="log-1", created_at="2026-01-01T00:00:00Z",
++        )
++        row = rows[0]
++        for key in ("id", "log_id", "frame_index", "frame_record_id", "class_name", "yolo_conf", "bbox",
++                    "confidence_score", "confidence_label", "lat", "lon", "geo_method", "depth_m",
++                    "footprint_geojson", "created_at"):
++            self.assertIn(key, row)
++        self.assertEqual(row["log_id"], "log-1")
++        self.assertEqual(row["geo_method"], "nav_fix")
++        self.assertIsNone(row["footprint_geojson"])
++        self.assertAlmostEqual(row["depth_m"], 60.0, places=2)
++        self.assertEqual(len(row["bbox"]), 4)
++
++
++class GeolocateCsvEndpointTests(unittest.TestCase):
++    """API-level: POST /logs/geolocate_csv actually writes into the same
++    `detections` table the rest of the API reads from."""
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self._orig_db_path = main.DB_PATH
++        self._orig_output_dir = main.OUTPUT_DIR
++        main.DB_PATH = Path(self._tmp.name) / "test_csv_geo.db"
++        main.OUTPUT_DIR = Path(self._tmp.name) / "outputs"
++
++        self.client = TestClient(main.app)
++        self.client.__enter__()
++
++        self.detections_csv_bytes = (
++            b"ping_id,pixel_x,bbox_w,bbox_h,class,confidence\n"
++            b"1000,1450,80,30,class_6,0.95\n"
++        )
++        self.nav_csv_bytes = (
++            b"ping_id,lat,lon,heading,altitude_m,depth_m,timestamp\n"
++            b"1000,19.0012,72.8015,45.0,8.0,52.0,2026-09-10T10:00:00Z\n"
++        )
++
++    def tearDown(self):
++        self.client.__exit__(None, None, None)
++        main.DB_PATH = self._orig_db_path
++        main.OUTPUT_DIR = self._orig_output_dir
++        self._tmp.cleanup()
++
++    def test_upload_geolocates_and_persists_into_detections_table(self):
++        r = self.client.post(
++            "/logs/geolocate_csv",
++            files={
++                "detections_csv": ("detections.csv", self.detections_csv_bytes, "text/csv"),
++                "nav_csv": ("nav.csv", self.nav_csv_bytes, "text/csv"),
++            },
++            params={"image_width": 2000, "range_per_pixel": 0.05},
++        )
++        self.assertEqual(r.status_code, 200, r.text)
++        body = r.json()
++        self.assertEqual(body["status"], "done")
++        log_id = body["log_id"]
++
++        detections = self.client.get(f"/logs/{log_id}/detections").json()
++        self.assertEqual(len(detections), 1)
++        self.assertAlmostEqual(detections[0]["depth_m"], 60.0, places=2)
++
++        map_fc = self.client.get(f"/logs/{log_id}/map").json()
++        self.assertEqual(len(map_fc["features"]), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/backend/tests/test_footprint_geometry.py b/backend/tests/test_footprint_geometry.py
+new file mode 100644
+index 0000000..927113b
+--- /dev/null
++++ b/backend/tests/test_footprint_geometry.py
+@@ -0,0 +1,137 @@
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++from fastapi.testclient import TestClient
++
++from src.backend import db_backend as db
++from src.backend import main
++from src.geolocation.georeference import geolocate_detection
++from src.geolocation.geojson_export import build_geojson
++from src.geolocation.nav import NavFix
++
++
++class FootprintGeometryTests(unittest.TestCase):
++    def setUp(self):
++        self.nav = NavFix(frame_index=0, lat=40.70000, lon=-73.98500, heading_deg=0.0,
++                           altitude_m=3.0, depth_m=24.0)
++        self.xyxy = [200, 100, 260, 180]
++
++    def test_footprint_is_a_closed_4_corner_ring(self):
++        geo = geolocate_detection(xyxy=self.xyxy, image_width_px=512, image_height_px=512,
++                                   nav_fix=self.nav, pixels_to_meters=0.15)
++        self.assertEqual(len(geo.footprint), 5)
++        self.assertEqual(geo.footprint[0], geo.footprint[-1])
++        lats = [p[0] for p in geo.footprint[:-1]]
++        lons = [p[1] for p in geo.footprint[:-1]]
++        self.assertGreater(max(lats) - min(lats), 0)
++        self.assertGreater(max(lons) - min(lons), 0)
++
++    def test_no_nav_fix_means_no_footprint(self):
++        geo = geolocate_detection(xyxy=self.xyxy, image_width_px=512, image_height_px=512,
++                                   nav_fix=None, pixels_to_meters=0.15)
++        self.assertEqual(geo.method, "placeholder")
++        self.assertIsNone(geo.footprint)
++
++    def test_omitting_image_height_px_keeps_old_point_only_behavior(self):
++        with_footprint = geolocate_detection(xyxy=self.xyxy, image_width_px=512, image_height_px=512,
++                                              nav_fix=self.nav, pixels_to_meters=0.15)
++        without_footprint = geolocate_detection(xyxy=self.xyxy, image_width_px=512,
++                                                 nav_fix=self.nav, pixels_to_meters=0.15)
++        self.assertIsNone(without_footprint.footprint)
++        self.assertEqual(without_footprint.lat, with_footprint.lat)
++        self.assertEqual(without_footprint.lon, with_footprint.lon)
++
++    def _detection(self):
++        geo = geolocate_detection(xyxy=self.xyxy, image_width_px=512, image_height_px=512,
++                                   nav_fix=self.nav, pixels_to_meters=0.15)
++        return {
++            "id": "d1", "log_id": "l1", "class_name": "pipe", "confidence_score": 91.2,
++            "confidence_label": "High", "yolo_conf": 0.83, "frame_record_id": "f1", "frame_index": 0,
++            "bbox_x1": 200, "bbox_y1": 100, "bbox_x2": 260, "bbox_y2": 180,
++            "vae_whole_image_percentile": 0.2, "geo_method": "nav_fix", "created_at": "2026-01-01T00:00:00Z",
++            "lat": geo.lat, "lon": geo.lon,
++            "footprint_geojson": json.dumps([[lon, lat] for lat, lon in geo.footprint]),
++        }
++
++    def test_geojson_auto_mode_emits_geometry_collection(self):
++        fc = build_geojson([self._detection()], geometry_mode="auto")
++        geom = fc["features"][0]["geometry"]
++        self.assertEqual(geom["type"], "GeometryCollection")
++        self.assertEqual({g["type"] for g in geom["geometries"]}, {"Point", "Polygon"})
++        self.assertTrue(fc["features"][0]["properties"]["has_footprint"])
++
++    def test_geojson_point_only_mode_ignores_footprint(self):
++        fc = build_geojson([self._detection()], geometry_mode="point_only")
++        self.assertEqual(fc["features"][0]["geometry"]["type"], "Point")
++
++    def test_geojson_footprint_only_mode(self):
++        fc = build_geojson([self._detection()], geometry_mode="footprint_only")
++        self.assertEqual(fc["features"][0]["geometry"]["type"], "Polygon")
++
++    def test_detection_without_footprint_still_works_in_every_mode(self):
++        det = self._detection()
++        det["footprint_geojson"] = None
++        for mode in ("auto", "point_only", "footprint_only"):
++            fc = build_geojson([det], geometry_mode=mode)
++            self.assertEqual(fc["features"][0]["geometry"]["type"], "Point")
++            self.assertFalse(fc["features"][0]["properties"]["has_footprint"])
++
++
++class MapEndpointGeometryModeTests(unittest.TestCase):
++    """GET /logs/{log_id}/map's `geometry_mode` query param (see main.py's
++    get_map_geojson) -- exercises the live API, not just build_geojson()
++    directly, so a regression in the FastAPI wiring itself (missing param,
++    swallowed ValueError, etc.) would actually be caught here."""
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self._orig_db_path = main.DB_PATH
++        main.DB_PATH = Path(self._tmp.name) / "test_map.db"
++
++        self.client = TestClient(main.app)
++        self.client.__enter__()  # runs main.py's @app.on_event("startup") against the temp db
++
++        nav = NavFix(frame_index=0, lat=40.70000, lon=-73.98500, heading_deg=0.0,
++                     altitude_m=3.0, depth_m=24.0)
++        geo = geolocate_detection(xyxy=[200, 100, 260, 180], image_width_px=512, image_height_px=512,
++                                   nav_fix=nav, pixels_to_meters=0.15)
++        with db.get_connection(main.DB_PATH) as conn:
++            db.create_log(conn, "log-1", "fixture.png", "image", "2026-01-01T00:00:00Z")
++            db.insert_detection(conn, {
++                "id": "d1", "log_id": "log-1", "frame_index": 0, "frame_record_id": "f1",
++                "class_name": "pipe", "yolo_conf": 0.9, "bbox": [200, 100, 260, 180],
++                "confidence_score": 91.0, "confidence_label": "High",
++                "lat": geo.lat, "lon": geo.lon, "geo_method": "nav_fix",
++                "footprint_geojson": json.dumps([[lon, lat] for lat, lon in geo.footprint]),
++                "created_at": "2026-01-01T00:00:00Z",
++            })
++
++    def tearDown(self):
++        self.client.__exit__(None, None, None)
++        main.DB_PATH = self._orig_db_path
++        self._tmp.cleanup()
++
++    def test_default_geometry_mode_is_auto(self):
++        r = self.client.get("/logs/log-1/map")
++        self.assertEqual(r.status_code, 200)
++        self.assertEqual(r.json()["features"][0]["geometry"]["type"], "GeometryCollection")
++
++    def test_point_only_mode(self):
++        r = self.client.get("/logs/log-1/map", params={"geometry_mode": "point_only"})
++        self.assertEqual(r.status_code, 200)
++        self.assertEqual(r.json()["features"][0]["geometry"]["type"], "Point")
++
++    def test_footprint_only_mode(self):
++        r = self.client.get("/logs/log-1/map", params={"geometry_mode": "footprint_only"})
++        self.assertEqual(r.status_code, 200)
++        self.assertEqual(r.json()["features"][0]["geometry"]["type"], "Polygon")
++
++    def test_invalid_geometry_mode_is_a_client_error_not_a_500(self):
++        r = self.client.get("/logs/log-1/map", params={"geometry_mode": "bogus"})
++        self.assertEqual(r.status_code, 400)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
