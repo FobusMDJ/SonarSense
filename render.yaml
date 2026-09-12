@@ -23,7 +23,7 @@
 
 databases:
   - name: sonarsense-db
-    plan: basic-256mb
+    plan: free
     postgresMajorVersion: "16"
 
 services:
@@ -32,7 +32,7 @@ services:
     runtime: docker
     rootDir: backend
     dockerfilePath: Dockerfile
-    plan: starter
+    plan: free
     healthCheckPath: /health
     envVars:
       - key: DB_BACKEND
