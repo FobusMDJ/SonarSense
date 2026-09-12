@@ -251,8 +251,8 @@ def _process_log_unlocked(
                     )
                     nav_fix = _nav_fix_for_detection(record, box["xyxy"], final.shape[:2])
                     geo = geolocate_detection(
-                        xyxy=box["xyxy"], image_width_px=final.shape[1], nav_fix=nav_fix,
-                        pixels_to_meters=pixels_to_meters, port_is_left=port_is_left,
+                        xyxy=box["xyxy"], image_width_px=final.shape[1], image_height_px=final.shape[0],
+                        nav_fix=nav_fix, pixels_to_meters=pixels_to_meters, port_is_left=port_is_left,
                     )
                     det = {
                         "id": str(uuid.uuid4()),
@@ -273,6 +273,11 @@ def _process_log_unlocked(
                         "lon": geo.lon if geo.method == "nav_fix" else None,
                         "geo_method": geo.method,
                         "depth_m": geo.depth_m,  # None unless the nav sidecar/XTF actually carried one
+                        # Debris footprint (4-corner polygon, not just the center point above) --
+                        # None whenever geo.footprint is None (placeholder detections, same rule as lat/lon).
+                        # Stored pre-flipped to GeoJSON's [lon, lat] coordinate order so
+                        # geojson_export.py can drop it straight into a Polygon with no reformatting.
+                        "footprint_geojson": json.dumps([[lon, lat] for lat, lon in geo.footprint]) if geo.footprint else None,
                         "vae_panel_dir": fr["vae_panel_dir"],
                         "created_at": _now_iso(),
                     }

@@ -64,6 +64,9 @@ class Detection(BaseModel):
     geo_method: Optional[str] = None
     depth_m: Optional[float] = None  # water depth below surface, from the nav fix if it carried one
     # (see src/geolocation/nav.py's NavFix.depth_m) -- null, never fabricated, when absent.
+    footprint_geojson: Optional[list[list[float]]] = None  # [[lon, lat], ...] closed ring -- the
+    # debris's real-world 4-corner footprint (see src/geolocation/georeference.py's
+    # GeoResult.footprint), null under the exact same rule as lat/lon: no nav fix, no shape.
     vae_panel_dir: Optional[str] = None
     created_at: str
 

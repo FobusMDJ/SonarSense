@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS detections (
     geo_method TEXT,                   -- 'nav_fix' | 'placeholder'
     depth_m REAL,                      -- water depth below surface, NULL unless the nav
                                         -- sidecar/XTF actually carried one (never fabricated)
+    footprint_geojson TEXT,            -- JSON list of [lon, lat] pairs, the debris's 4-corner
+                                        -- real-world footprint polygon; NULL for placeholder
+                                        -- detections (see georeference.py's GeoResult.footprint)
     vae_panel_dir TEXT,
     created_at TEXT NOT NULL
 );
@@ -86,6 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
 # TABLE, or every insert against it fails with "no column named depth_m".
 _DETECTIONS_MIGRATIONS = [
     ("depth_m", "REAL"),
+    ("footprint_geojson", "TEXT"),
 ]
 
 _LOG_MIGRATIONS = [
@@ -207,15 +211,15 @@ def insert_detection(conn: sqlite3.Connection, det: dict[str, Any]) -> None:
             id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
             bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
             confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
-            lat, lon, geo_method, depth_m, vae_panel_dir, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
             det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
             *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
             det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
             det.get("lat"), det.get("lon"), det.get("geo_method"), det.get("depth_m"),
-            det.get("vae_panel_dir"), det["created_at"],
+            det.get("footprint_geojson"), det.get("vae_panel_dir"), det["created_at"],
         ),
     )
 
@@ -235,6 +239,11 @@ def list_detections(conn: sqlite3.Connection, log_id: str,
         if d.get("confidence_breakdown"):
             try:
                 d["confidence_breakdown"] = json.loads(d["confidence_breakdown"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        if d.get("footprint_geojson"):
+            try:
+                d["footprint_geojson"] = json.loads(d["footprint_geojson"])
             except (TypeError, json.JSONDecodeError):
                 pass
         results.append(d)

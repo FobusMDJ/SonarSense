@@ -41,6 +41,11 @@ logger = get_logger(__name__)
 DEFAULT_DSN = "postgresql://sonarsense:sonarsense@localhost:5432/sonarsense"
 
 SCHEMA = """
+-- footprint_geojson / geom_footprint (added alongside lat/lon/geom, not
+-- instead of them -- see georeference.py's GeoResult.footprint): the
+-- debris's real-world 4-corner footprint polygon, not just its center
+-- point. geom_footprint is NULL under the exact same placeholder rule as
+-- geom (see _footprint_geom_expr below).
 CREATE EXTENSION IF NOT EXISTS postgis;
 
 CREATE TABLE IF NOT EXISTS logs (
@@ -81,9 +86,11 @@ CREATE TABLE IF NOT EXISTS detections (
     lon DOUBLE PRECISION,
     geo_method TEXT,
     depth_m DOUBLE PRECISION,
+    footprint_geojson JSONB,
     vae_panel_dir TEXT,
     created_at TEXT NOT NULL,
-    geom geometry(Point, 4326)
+    geom geometry(Point, 4326),
+    geom_footprint geometry(Polygon, 4326)
 );
 
 CREATE TABLE IF NOT EXISTS frame_analyses (
@@ -99,9 +106,12 @@ CREATE TABLE IF NOT EXISTS frame_analyses (
 CREATE INDEX IF NOT EXISTS idx_detections_log_id ON detections(log_id);
 CREATE INDEX IF NOT EXISTS idx_frame_analyses_log_id ON frame_analyses(log_id);
 CREATE INDEX IF NOT EXISTS idx_detections_geom ON detections USING GIST(geom);
+CREATE INDEX IF NOT EXISTS idx_detections_geom_footprint ON detections USING GIST(geom_footprint);
 ALTER TABLE logs ADD COLUMN IF NOT EXISTS yolo_confidence_threshold DOUBLE PRECISION;
 ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_inference_ms DOUBLE PRECISION;
 ALTER TABLE logs ADD COLUMN IF NOT EXISTS detector_frames INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE detections ADD COLUMN IF NOT EXISTS footprint_geojson JSONB;
+ALTER TABLE detections ADD COLUMN IF NOT EXISTS geom_footprint geometry(Polygon, 4326);
 """
 
 # Everything in SCHEMA after the `CREATE EXTENSION` line -- used as a
@@ -164,6 +174,18 @@ def _geom_expr(lat: Optional[float], lon: Optional[float]) -> Optional[str]:
     if lat is None or lon is None or (lat == 0.0 and lon == 0.0):
         return None
     return "ST_SetSRID(ST_MakePoint(%s, %s), 4326)"
+
+
+def _footprint_geom_expr(footprint_ring: Optional[list]) -> tuple[Optional[str], Optional[str]]:
+    """Builds geom_footprint from a [[lon, lat], ...] ring (see
+    georeference.py's GeoResult.footprint / pipeline_runner.py's
+    footprint_geojson). Returns (sql_fragment, geojson_param) -- both None
+    when there's no footprint, same placeholder discipline as _geom_expr:
+    no shape gets fabricated for a detection with no nav fix."""
+    if not footprint_ring:
+        return None, None
+    polygon_geojson = json.dumps({"type": "Polygon", "coordinates": [footprint_ring]})
+    return "ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)", polygon_geojson
 
 
 # --------------------------------------------------------------------------
@@ -259,21 +281,30 @@ def insert_detection(conn, det: dict[str, Any]) -> None:
     geom_sql = geom_expr if geom_expr else "NULL"
     geom_params = (lon, lat) if geom_expr else ()
 
+    footprint_ring = det.get("footprint_geojson")
+    if isinstance(footprint_ring, str):
+        footprint_ring = json.loads(footprint_ring)
+    footprint_col = psycopg2.extras.Json(footprint_ring) if footprint_ring else None
+    footprint_geom_expr, footprint_geom_param = _footprint_geom_expr(footprint_ring)
+    footprint_geom_sql = footprint_geom_expr if footprint_geom_expr else "NULL"
+    footprint_geom_params = (footprint_geom_param,) if footprint_geom_expr else ()
+
     with conn.cursor() as cur:
         cur.execute(
             f"""INSERT INTO detections (
                 id, log_id, frame_index, frame_record_id, frame_image_path, class_name, yolo_conf,
                 bbox_x1, bbox_y1, bbox_x2, bbox_y2, confidence_score, confidence_label,
                 confidence_breakdown, vae_box_error, vae_whole_image_error, vae_whole_image_percentile,
-                lat, lon, geo_method, depth_m, vae_panel_dir, created_at, geom
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {geom_sql})""",
+                lat, lon, geo_method, depth_m, footprint_geojson, vae_panel_dir, created_at, geom, geom_footprint
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                      {geom_sql}, {footprint_geom_sql})""",
             (
                 det["id"], det["log_id"], det["frame_index"], det["frame_record_id"],
                 det.get("frame_image_path"), det["class_name"], det["yolo_conf"],
                 *det["bbox"], det["confidence_score"], det["confidence_label"], breakdown,
                 det.get("vae_box_error"), det.get("vae_whole_image_error"), det.get("vae_whole_image_percentile"),
-                lat, lon, det.get("geo_method"), det.get("depth_m"),
-                det.get("vae_panel_dir"), det["created_at"], *geom_params,
+                lat, lon, det.get("geo_method"), det.get("depth_m"), footprint_col,
+                det.get("vae_panel_dir"), det["created_at"], *geom_params, *footprint_geom_params,
             ),
         )
 
@@ -292,6 +323,7 @@ def list_detections(conn, log_id: str, min_confidence: Optional[float] = None) -
     for r in rows:
         d = dict(r)
         d.pop("geom", None)  # internal-only; lat/lon already carry the same info for callers
+        d.pop("geom_footprint", None)  # internal-only; footprint_geojson already carries the same ring for callers
         # confidence_breakdown comes back already-deserialized (JSONB -> dict via psycopg2)
         results.append(d)
     return results
@@ -322,5 +354,6 @@ def detections_within_radius(conn, lat: float, lon: float, radius_m: float,
     for r in rows:
         d = dict(r)
         d.pop("geom", None)
+        d.pop("geom_footprint", None)
         results.append(d)
     return results

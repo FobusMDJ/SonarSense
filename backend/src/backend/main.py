@@ -8,6 +8,8 @@ Endpoints (all under this one app):
   POST   /logs/upload_dir                      upload a whole folder of frames (+ optional nav
                                                  sidecar) as one multipart request, starts processing
   POST   /logs/upload_zip                      upload images + metadata CSV as one ZIP archive
+  POST   /logs/geolocate_csv                    geolocate detections.csv (from an external/offline
+                                                 detector) against nav.csv -- no image/YOLO/VAE stage
   POST   /logs/ingest_local                    process a folder that already exists on the SERVER's
                                                  own filesystem -- no upload at all (dev/local use)
   GET    /health                                service + XTF-reader status
@@ -17,7 +19,8 @@ Endpoints (all under this one app):
   GET    /logs/{log_id}/detections              detection records (the "records" area)
   GET    /logs/{log_id}/stats                   aggregate YOLO stats ("model output stats" area)
   GET    /logs/{log_id}/vae_stats               VAE anomaly-error stats ("VAE stats" area)
-  GET    /logs/{log_id}/map                     GeoJSON of geolocated detections ("GPS map" area)
+  GET    /logs/{log_id}/map                     GeoJSON of geolocated detections ("GPS map" area);
+                                                 ?geometry_mode=auto|point_only|footprint_only
   GET    /logs/{log_id}/report.json             downloadable JSON report
   GET    /logs/{log_id}/report.csv              downloadable CSV report
   GET    /logs/{log_id}/report.geojson          downloadable GeoJSON (same content as /map)
@@ -46,7 +49,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.backend import db_backend as db
 from src.backend.api_routes import router as frontend_api_router
 from src.backend.archive_ingestion import extract_survey_zip
-from src.backend.pipeline_runner import process_log
+from src.backend.pipeline_runner import _write_reports, process_log
+from src.geolocation.csv_engine import run_csv_pipeline_to_detections
 from src.backend.model_release import model_metadata, validate_present_checkpoints
 from src.backend.schemas import Detection, LocalIngestRequest, LogSummary, ModelOutputStats, UploadResponse, VaeStats
 from src.geolocation.geojson_export import build_geojson, write_geojson
@@ -347,6 +351,73 @@ async def upload_log_zip(
     )
 
 
+@app.post("/logs/geolocate_csv", response_model=UploadResponse)
+async def geolocate_csv(
+    detections_csv: UploadFile = File(..., description="Detections CSV: ping_id,pixel_x,bbox_w,bbox_h,class,confidence "
+                                                          "(column-name aliases width/w, height/h also accepted)."),
+    nav_csv: UploadFile = File(..., description="Nav CSV: ping_id,lat,lon,heading,altitude_m,depth_m,timestamp "
+                                                  "(ship_lat/ship_lon/heading_deg/altitude/depth/timestamp_utc "
+                                                  "aliases also accepted)."),
+    image_width: int = 2000,
+    range_per_pixel: float = DEFAULT_PIXELS_TO_METERS,
+) -> UploadResponse:
+    """Second ingestion path alongside /logs/upload et al.: geolocates
+    detections that were already produced by an EXTERNAL/offline detector
+    (a Roboflow-hosted model, a prior batch run, ...) rather than running
+    YOLO/VAE here. See src/geolocation/csv_engine.py's module docstring for
+    the full math and its one intentional fix (object depth = nav depth +
+    altitude) versus the standalone script this was adapted from.
+
+    Synchronous (no background thread/WebSocket progress) -- this is pure
+    arithmetic over two CSVs, not an ML pipeline, so it's fast enough to
+    finish within the request. Results are written into the SAME
+    `detections` table as image-pipeline logs (source_format=
+    "csv_detections"), so they show up in GET /logs/{id}/map,
+    /logs/{id}/detections, and the downloadable reports identically to
+    pipeline-produced detections -- one unified store regardless of source.
+    A ping_id in detections_csv with no matching row in nav_csv is skipped
+    (not stored as a placeholder), same join-and-skip behavior as the
+    original standalone script; the response's `message` reports how many
+    were skipped."""
+    log_id = str(uuid.uuid4())
+    log_dir = UPLOAD_DIR / log_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    detections_path = log_dir / (detections_csv.filename or "detections.csv")
+    with open(detections_path, "wb") as f:
+        shutil.copyfileobj(detections_csv.file, f)
+    nav_path = log_dir / (nav_csv.filename or "nav.csv")
+    with open(nav_path, "wb") as f:
+        shutil.copyfileobj(nav_csv.file, f)
+
+    created_at = _now_iso()
+    with db.get_connection(DB_PATH) as conn:
+        db.create_log(conn, log_id, detections_csv.filename or "detections.csv", "csv_detections", created_at,
+                       pixels_to_meters=range_per_pixel)
+
+    try:
+        rows, n_skipped = run_csv_pipeline_to_detections(
+            detections_path, nav_path, image_width, range_per_pixel, log_id, created_at,
+        )
+        with db.get_connection(DB_PATH) as conn:
+            for row in rows:
+                db.insert_detection(conn, row)
+            db.update_log_counts(conn, log_id, len(rows), len(rows))
+            db.update_log_status(conn, log_id, "done", completed_at=_now_iso())
+
+        out_dir = OUTPUT_DIR / log_id
+        _write_reports(DB_PATH, log_id, out_dir)
+    except Exception as exc:
+        with db.get_connection(DB_PATH) as conn:
+            db.update_log_status(conn, log_id, "error", error_message=str(exc), completed_at=_now_iso())
+        raise HTTPException(422, f"CSV geolocation failed: {exc}") from exc
+
+    message = f"Geolocated {len(rows)} detection(s)."
+    if n_skipped:
+        message += f" Skipped {n_skipped} with no matching nav row."
+    return UploadResponse(log_id=log_id, status="done", message=message)
+
+
 @app.post("/logs/ingest_local", response_model=UploadResponse)
 def ingest_local_directory(req: LocalIngestRequest) -> UploadResponse:
     """Process a folder that ALREADY exists on the SERVER's own filesystem --
@@ -524,18 +595,26 @@ def get_vae_output_file(log_id: str, frame_record_id: str, filename: str) -> Fil
 # --------------------------------------------------------------------------
 
 @app.get("/logs/{log_id}/map")
-def get_map_geojson(log_id: str) -> dict:
+def get_map_geojson(log_id: str, geometry_mode: str = "auto") -> dict:
     """GeoJSON FeatureCollection -- only detections with a real nav-derived
     location (geo_method == 'nav_fix'). Detections with no nav data are
     excluded here (not plotted as fake points); use /detections for those.
     Built by the geolocation engine's own GeoJSON output method (src.
     geolocation.geojson_export.build_geojson) -- the same function
     pipeline_runner.py uses to write report.geojson to disk, so this live
-    endpoint and that downloadable file are always identical in shape."""
+    endpoint and that downloadable file are always identical in shape.
+
+    `geometry_mode` (query param, default "auto") is passed straight
+    through to build_geojson -- see geojson_export.py's GEOMETRY_MODES for
+    "auto" | "point_only" | "footprint_only". An unrecognized value is a
+    client error (400), not a silent fallback to "auto"."""
     _require_log(log_id)
     with db.get_connection(DB_PATH) as conn:
         detections = db.list_detections(conn, log_id)
-    return build_geojson(detections, only_geolocated=True)
+    try:
+        return build_geojson(detections, only_geolocated=True, geometry_mode=geometry_mode)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 # --------------------------------------------------------------------------
