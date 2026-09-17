@@ -1,19 +1,11 @@
-# Render Blueprint: deploys the backend, frontend, and a PostGIS-enabled
-# Postgres database together. In the Render dashboard: New -> Blueprint,
+# Render Blueprint: deploys the backend and a PostGIS-enabled Postgres
+# database. The Vite frontend is deployed separately on Vercel. In the
+# Render dashboard: New -> Blueprint,
 # point it at this repo, and it reads this file automatically (must live
 # at the repo root, which is why it's here and not under backend/).
 #
-# After the first deploy, set these secrets on the sonarsense-backend
-# service (Render dashboard -> service -> Environment) -- they're marked
-# `sync: false` below so Render prompts for them instead of expecting them
-# in this committed file:
-#   YOLO_WEIGHTS_URL  -> direct-download URL for your best.pt
-#   VAE_WEIGHTS_URL   -> direct-download URL for vae_epoch100.pth
-#   B2U_WEIGHTS_URL   -> direct-download URL for B2Ueph2.pth (OPTIONAL --
-#                        only needed if you plan to use denoise_method=
-#                        blind2unblind on an upload; leave blank otherwise,
-#                        docker-entrypoint.sh just skips it when unset)
-# (see backend/docker-entrypoint.sh for what these do)
+# The released checkpoints are public GitHub release assets. The container
+# downloads them at startup and /health reports their presence and digests.
 #
 # The database's connection string is wired to the backend automatically
 # via fromDatabase below -- no DSN is ever written into this file or into
@@ -42,20 +34,8 @@ services:
           name: sonarsense-db
           property: connectionString
       - key: YOLO_WEIGHTS_URL
-        sync: false
+        value: https://github.com/FobusMDJ/SonarSense/releases/download/weights-v1/best.pt
       - key: VAE_WEIGHTS_URL
-        sync: false
+        value: https://github.com/FobusMDJ/SonarSense/releases/download/weights-v1/vae_epoch100.pth
       - key: B2U_WEIGHTS_URL
-        sync: false
-
-  - type: web
-    name: sonarsense-frontend
-    runtime: static
-    buildCommand: pnpm install && pnpm build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_BASE_URL
-        sync: false  # set this to sonarsense-backend's URL after its first deploy
-        # (Render assigns the backend's URL only once it exists, so this
-        # can't be wired automatically on a first-ever deploy of both
-        # services together -- set it once, then every later deploy keeps it)
+        value: https://github.com/FobusMDJ/SonarSense/releases/download/weights-v1/B2Ueph2.pth
