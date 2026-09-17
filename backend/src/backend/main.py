@@ -109,6 +109,19 @@ def _startup() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     db.init_db(DB_PATH)
+    # Background inference runs in this web-service process. If the worker
+    # restarts, those threads no longer exist; do not leave their rows looking
+    # active forever in the frontend.
+    with db.get_connection(DB_PATH) as conn:
+        for log in db.list_logs(conn):
+            if log["status"] in {"uploaded", "processing"}:
+                db.update_log_status(
+                    conn,
+                    log["id"],
+                    "error",
+                    error_message="Stopped because the processing worker restarted.",
+                    completed_at=_now_iso(),
+                )
     # Missing files remain visible through /health; a present but corrupted
     # or substituted release file is unsafe and stops startup immediately.
     validate_present_checkpoints(MODEL_PATHS)
