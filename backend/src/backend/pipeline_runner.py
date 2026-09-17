@@ -48,7 +48,9 @@ KNOWN V1 LIMITATIONS (stated plainly, not hidden):
 from __future__ import annotations
 
 import csv
+import gc
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -59,7 +61,14 @@ import numpy as np
 import torch
 
 from src.backend import class_taxonomy, db_backend as db
-from src.backend.model_release import INFERENCE_LOCK, JOB_LOCK, get_vae_model, get_yolo_model
+from src.backend.model_release import (
+    INFERENCE_LOCK,
+    JOB_LOCK,
+    get_vae_model,
+    get_yolo_model,
+    release_vae_model,
+    release_yolo_model,
+)
 from src.confidence.scoring import score_detection
 from src.geolocation.geojson_export import write_geojson
 from src.geolocation.georeference import geolocate_detection
@@ -73,6 +82,7 @@ from src.vae.vae_analysis import crop_box, run_vae, save_all_modules
 logger = get_logger(__name__)
 
 ProgressCallback = Callable[[dict], None]
+LOW_MEMORY_INFERENCE = os.environ.get("SONARSENSE_LOW_MEMORY", "1").lower() not in {"0", "false", "no"}
 
 
 def _now_iso() -> str:
@@ -168,9 +178,11 @@ def _process_log_unlocked(
         preproc_cfg = _build_preprocessing_config(denoise_method, denoise_weights_path, contrast_method)
         pipeline = PreprocessingPipeline(config=preproc_cfg)
         yolo = get_yolo_model(str(yolo_weights))
-        vae_model = get_vae_model(str(vae_weights), str(torch_device))
         detector_inference_ms = 0.0
 
+        # Run detection and anomaly analysis in separate passes. Keeping both
+        # Torch models resident simultaneously exceeds a 512 MB Render worker;
+        # this ordering preserves the outputs while bounding peak memory.
         frame_records = []  # per-frame working state, built up across passes
         for i, record in enumerate(records):
             _emit(progress_cb, log_id=log_id, stage="preprocess", frame_index=i, n_frames_total=n_frames,
@@ -192,6 +204,26 @@ def _process_log_unlocked(
                 for b in r.boxes
             ]
 
+            frame_records.append({
+                "record": record,
+                "final": final,
+                "boxes": boxes,
+            })
+            del results, r
+
+        if LOW_MEMORY_INFERENCE:
+            del yolo
+            release_yolo_model()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        vae_model = get_vae_model(str(vae_weights), str(torch_device))
+        for i, frame_record in enumerate(frame_records):
+            record = frame_record["record"]
+            final = frame_record["final"]
+            boxes = frame_record["boxes"]
+
             _emit(progress_cb, log_id=log_id, stage="vae", frame_index=i, n_frames_total=n_frames,
                   message=f"Running VAE analysis on frame {i + 1}/{n_frames}")
             with INFERENCE_LOCK:
@@ -208,14 +240,18 @@ def _process_log_unlocked(
                 else:
                     box_vae_errors.append(None)
 
-            frame_records.append({
-                "record": record,
-                "final": final,
-                "boxes": boxes,
+            frame_record.update({
                 "box_vae_errors": box_vae_errors,
                 "whole_image_error": vae_result["scalar_error"],
                 "vae_panel_dir": str(frame_out_dir),
             })
+
+        if LOW_MEMORY_INFERENCE:
+            del vae_model
+            release_vae_model()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Whole-image anomaly percentile within THIS log's own frames (same
         # convention as claude/phase1-baseline-error-analysis.md: 0 = most

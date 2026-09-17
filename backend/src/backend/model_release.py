@@ -91,6 +91,16 @@ def get_vae_model(weights_path: str, device_name: str):
     return load_model(weights_path, torch.device(device_name))
 
 
+def release_yolo_model() -> None:
+    """Drop cached detector references between low-memory pipeline passes."""
+    get_yolo_model.cache_clear()
+
+
+def release_vae_model() -> None:
+    """Drop cached VAE references after a low-memory pipeline pass."""
+    get_vae_model.cache_clear()
+
+
 def model_metadata(paths: dict[str, Path]) -> dict:
     import torch
     statuses = validate_present_checkpoints(paths)

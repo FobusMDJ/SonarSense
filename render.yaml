@@ -29,6 +29,8 @@ services:
     envVars:
       - key: DB_BACKEND
         value: postgres
+      - key: SONARSENSE_LOW_MEMORY
+        value: "1"
       - key: POSTGRES_DSN
         fromDatabase:
           name: sonarsense-db
