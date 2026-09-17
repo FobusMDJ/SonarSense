@@ -1,12 +1,8 @@
-// Real API client for the SonarSense FastAPI backend. Reads the backend's
-// base URL from VITE_API_BASE_URL (set on the Render frontend service's
-// Environment tab -- see render.yaml at the repo root). If it's unset
-// (e.g. running `vite dev` with no .env), requests fall back to the
-// same-origin relative path -- fine for local dev with a proxy, but a
-// production build with no VITE_API_BASE_URL set will simply fail to
-// reach a backend, which every page below surfaces as a clear error
-// state instead of silently falling back to fake data.
-const RAW_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').trim()
+// Real API client for the SonarSense FastAPI backend. Local development
+// overrides this through .env.local; Vercel uses the deployed Render API
+// fallback when no project-level environment variable has been configured.
+const PRODUCTION_API_BASE = 'https://sonarsense-backend-ezkh.onrender.com'
+const RAW_BASE = (import.meta.env.VITE_API_BASE_URL ?? PRODUCTION_API_BASE).trim()
 export const API_BASE = RAW_BASE.replace(/\/+$/, '')
 
 export class ApiError extends Error {
