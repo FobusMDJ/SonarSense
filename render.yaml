@@ -31,6 +31,8 @@ services:
         value: postgres
       - key: SONARSENSE_LOW_MEMORY
         value: "1"
+      - key: SONARSENSE_YOLO_INPUT_SIZE
+        value: "320"
       - key: POSTGRES_DSN
         fromDatabase:
           name: sonarsense-db

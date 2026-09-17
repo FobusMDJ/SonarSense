@@ -83,6 +83,7 @@ logger = get_logger(__name__)
 
 ProgressCallback = Callable[[dict], None]
 LOW_MEMORY_INFERENCE = os.environ.get("SONARSENSE_LOW_MEMORY", "1").lower() not in {"0", "false", "no"}
+YOLO_INFERENCE_SIZE = int(os.environ.get("SONARSENSE_YOLO_INPUT_SIZE", "320"))
 
 
 def _now_iso() -> str:
@@ -194,7 +195,12 @@ def _process_log_unlocked(
                   message=f"Running YOLO on frame {i + 1}/{n_frames}")
             started = time.perf_counter()
             with INFERENCE_LOCK:
-                results = yolo.predict(source=final, conf=yolo_conf, verbose=False)
+                results = yolo.predict(
+                    source=final,
+                    conf=yolo_conf,
+                    imgsz=YOLO_INFERENCE_SIZE,
+                    verbose=False,
+                )
             detector_inference_ms += (time.perf_counter() - started) * 1000.0
             r = results[0]
             names = r.names
