@@ -158,7 +158,7 @@ export function DetectionMap({ items, onSelect, full = false }: { items: Detecti
     <div className="ds-map-zoom"><button aria-label="Zoom in" title="Zoom in" onClick={() => mapRef.current?.zoomIn()}><Plus size={19}/></button><button aria-label="Zoom out" title="Zoom out" onClick={() => mapRef.current?.zoomOut()}><Minus size={19}/></button></div>
     {style === 'Bathymetry' && <div className="ds-map-north" title="North" aria-label="North"><Compass size={15}/><b>N</b></div>}
     {unlocatedCount > 0 && <div className="ds-map-note">{unlocatedCount} detection(s) have no GPS fix and aren't shown here.</div>}
-    {style === 'Bathymetry' && <div className="ds-map-bathy-note">Illustrative seafloor relief for demo purposes -- not measured bathymetry.</div>}
+    {style === 'Bathymetry' && <div className="ds-map-bathy-note">Illustrative seafloor relief for demonstration only. This is not measured bathymetry.</div>}
     {style === 'Bathymetry'
       ? <div className="ds-map-key ds-map-depth-key"><strong>Depth in m</strong>{bathymetry.legend.map(stop => <span key={stop.depth}><i style={{ background: stop.color }}/>{stop.depth}</span>)}</div>
       : <div className="ds-map-key"><strong>Confidence</strong>{[['#4eaf6b', '80–100%'], ['#219ad0', '60–80%'], ['#e5a942', '40–60%'], ['#dd663c', '20–40%'], ['#bf586a', '0–20%']].map(([color, label]) => <span key={label}><i style={{ background: color }}/>{label}</span>)}</div>}

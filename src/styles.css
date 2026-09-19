@@ -4,7 +4,7 @@
   color: #e8f4f3;
   background: #040b12;
   font-synthesis: none;
-  --abyss: #040b12;
+  --abyss: #0b1116;
   --surface: #07141e;
   --surface-2: #0a1b27;
   --surface-3: #0d2532;
@@ -29,8 +29,8 @@
 
 * { box-sizing: border-box; }
 html { background: var(--abyss); scroll-padding-top: 88px; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 82% 2%, #0a2736 0, transparent 27%), var(--abyss); }
-.route-loading { min-height: 100vh; display: grid; place-items: center; color: #91a9b2; background: #061019; font: 500 10px 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: .12em; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--abyss); }
+.route-loading { min-height: 100vh; display: grid; place-items: center; color: #9baab3; background: var(--abyss); font: 500 10px 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: .12em; }
 button, input, select { font: inherit; }
 button, select { cursor: pointer; }
 button { color: inherit; }

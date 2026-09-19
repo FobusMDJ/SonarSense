@@ -152,7 +152,7 @@ export function UploadView({ onProcessed }: UploadViewProps) {
                    onChange={event => setNavFile(event.target.files?.[0] ?? null)} />
             <CloudUpload size={20} />
             <strong>{navFile ? navFile.name : 'Optional: navigation CSV'}</strong>
-            <small>frame_index,lat,lon,heading_deg[,altitude_m,timestamp] -- ignored for .xtf uploads</small>
+            <small>frame_index,lat,lon,heading_deg[,altitude_m,timestamp]. This sidecar is ignored for .xtf uploads.</small>
           </label>
 
           <div className="ds-upload-options">
@@ -200,7 +200,7 @@ export function UploadView({ onProcessed }: UploadViewProps) {
           {latest && phase === 'processing' && (
             <p className="ds-panel-note">
               <Loader2 size={14} className="ds-spin" /> {STAGE_LABELS[latest.stage] ?? latest.stage}
-              {latest.n_frames_total ? ` — frame ${((latest.frame_index ?? 0) + 1)}/${latest.n_frames_total}` : ''}
+              {latest.n_frames_total ? ` · frame ${((latest.frame_index ?? 0) + 1)}/${latest.n_frames_total}` : ''}
             </p>
           )}
           {phase === 'error' && <p className="ds-panel-note ds-error-text">{errorMessage}</p>}

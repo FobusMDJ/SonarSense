@@ -16,19 +16,19 @@ interface PipelineViewProps {
 
 const STEP_DEFS = [
   { key: 'input', title: 'Preprocessed input frame', file: '01_original.png' as const,
-    caption: 'What the models actually saw: after denoising, contrast enhancement, and resize -- not the raw sensor tile.' },
+    caption: 'What the models actually saw after denoising, contrast enhancement, and resize. This is not the raw sensor tile.' },
   { key: 'recon', title: 'VAE reconstruction', file: '02_reconstruction.png' as const,
     caption: 'The autoencoder’s best attempt at reproducing the input from a compressed latent representation.' },
   { key: 'overlay', title: 'Anomaly overlay', file: '03_anomaly_overlay.png' as const,
-    caption: 'Reconstruction-error heatmap blended over the original frame -- where the seafloor looks unusual, in context.' },
+    caption: 'Reconstruction-error heatmap blended over the original frame, showing where the seafloor looks unusual in context.' },
   { key: 'diff', title: 'Difference heatmap', file: '04_difference_heatmap.png' as const,
     caption: 'The colorized |original − reconstruction| error map alone, no blending.' },
   { key: 'edges', title: 'Edge / contour map', file: '05_edge_contour_map.png' as const,
-    caption: 'Boundaries of the thresholded anomalous region -- useful for reading off shape rather than a filled blob.' },
+    caption: 'Boundaries of the thresholded anomalous region, useful for reading shape rather than a filled area.' },
   { key: 'legend', title: 'Difference map (calibrated)', file: '06_difference_map_legend.png' as const,
     caption: 'The same error map with a High/Low colorbar, so a value can be read off rather than just eyeballed.' },
   { key: 'surface', title: '3D anomaly surface', file: '07_3d_anomaly_surface.png' as const,
-    caption: 'Reconstruction error plotted as a height field -- peaks are where the VAE was most surprised.' },
+    caption: 'Reconstruction error plotted as a height field. Peaks show where the VAE was most surprised.' },
 ] as const
 
 function BoundingBoxes({ detections, imageSrc }: { detections: RawDetection[]; imageSrc: string }) {
@@ -214,7 +214,7 @@ export function PipelineView({ logs, selectedLogId, onSelectLog }: PipelineViewP
             {metadata && (
               <>
                 <div className="ds-metric-section-head">
-                  <div><strong>Training validation</strong><span>Published checkpoint metrics—not accuracy for this uploaded log.</span></div>
+                  <div><strong>Training validation</strong><span>Published checkpoint metrics, not accuracy for this uploaded log.</span></div>
                   <small>{metadata.detector.name} · {metadata.release_tag} · {metadata.device.toUpperCase()}</small>
                 </div>
                 <div className="ds-model-metrics">
@@ -331,7 +331,7 @@ export function PipelineView({ logs, selectedLogId, onSelectLog }: PipelineViewP
             <div className="ds-no-results">
               <ScanSearch size={24} />
               <strong>No detections in this log to walk through</strong>
-              <p>This log processed successfully but YOLO26 found no objects above its confidence threshold, so there's no frame-level detection walkthrough to show -- VAE statistics above still reflect every frame analyzed.</p>
+              <p>This log processed successfully, but YOLO26 found no objects above its confidence threshold. VAE statistics above still reflect every frame analyzed.</p>
             </div>
           )}
         </>

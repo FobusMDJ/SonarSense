@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Anchor, Crosshair, Loader2, MapPinned, RadioTower, ScanSearch, X } from 'lucide-react'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import './intelligence-map.css'
+import './professional-map.css'
 import { ApiError, getSurvey, getSurveyDetections, getSurveySummary, listSurveys, type ApiSurvey } from '../../lib/api'
 import { debrisClasses, priorityLevels, type Detection, type MapFiltersState, type Survey, type SurveySummaryData } from './types'
 import { apiDetectionToLocal } from './services/mapDataAdapter'
@@ -161,6 +162,7 @@ export default function IntelligenceMapPage() {
       <footer className="ss-statusbar">
         <span><MapPinned size={14} /> WGS 84</span>
         <span>Coastal survey extent</span>
+        <nav aria-label="Legal"><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav>
         <span>{survey ? `${filteredDetections.length} of ${detections.length} detections visible` : 'No survey loaded'}</span>
       </footer>
     </div>
